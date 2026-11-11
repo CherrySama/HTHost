@@ -151,6 +151,30 @@ export class Simulation {
       this.gripperTarget = Math.max(0, Math.min(2, angle));
   }
 
+  setRobotPose(positions, gripper) {
+    this.robotData ??= new this.mj.MjData(this.model);
+    this.writePose(this.robotData, positions, gripper);
+    this.mj.mj_forward(this.model, this.robotData);
+  }
+
+  setTargetPreview(positions, gripper) {
+    this.previewData ??= new this.mj.MjData(this.model);
+    this.writePose(this.previewData, positions, gripper);
+    this.mj.mj_kinematics(this.model, this.previewData);
+    return this.previewData;
+  }
+
+  writePose(data, positions, gripper) {
+    this.joints.forEach((joint, index) => {
+      data.qpos[joint.q] = positions[index];
+    });
+    if (Number.isFinite(gripper)) {
+      const displacement = (gripperOpening(gripper) / 1000 - 0.082) / 2;
+      data.qpos[this.gripperJoints[0].q] = displacement;
+      data.qpos[this.gripperJoints[1].q] = -displacement;
+    }
+  }
+
   getGripperState() {
     const left = this.data.qpos[this.gripperJoints[0].q];
     const right = this.data.qpos[this.gripperJoints[1].q];

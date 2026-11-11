@@ -169,6 +169,50 @@ export class Viewer {
     this.dirty = true;
   }
 
+  setTargetPreview(data, actual) {
+    if (!data) {
+      if (this.targetPreview?.visible) {
+        this.targetPreview.visible = false;
+        this.dirty = true;
+      }
+      return;
+    }
+
+    if (!this.targetPreview) {
+      const material = new THREE.MeshBasicMaterial({
+        color: "#367fde",
+        transparent: true,
+        opacity: 0.38,
+        depthWrite: false,
+      });
+      this.targetPreview = new THREE.Group();
+      this.targetPreview.name = "target-preview";
+      for (const { mesh } of this.items) {
+        this.targetPreview.add(new THREE.Mesh(mesh.geometry, material));
+      }
+      this.scene.add(this.targetPreview);
+    }
+
+    const positions = data.geom_xpos;
+    const rotations = data.geom_xmat;
+    const actualPositions = actual.geom_xpos;
+    const actualRotations = actual.geom_xmat;
+    this.items.forEach(({ id }, index) => {
+      const mesh = this.targetPreview.children[index];
+      const moved = positions.subarray(id * 3, id * 3 + 3)
+        .some((value, offset) => Math.abs(value - actualPositions[id * 3 + offset]) > 1e-5)
+        || rotations.subarray(id * 9, id * 9 + 9)
+          .some((value, offset) => Math.abs(value - actualRotations[id * 9 + offset]) > 1e-5);
+      mesh.visible = moved;
+      if (moved) {
+        mesh.position.fromArray(positions, id * 3);
+        this.setRotation(mesh, rotations, id);
+      }
+    });
+    this.targetPreview.visible = true;
+    this.dirty = true;
+  }
+
   setOverlayVisible(name, visible) {
     let group = this.overlays.get(name);
     if (!group && visible) {

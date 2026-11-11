@@ -90,9 +90,81 @@ header {
   border-radius: 50%;
   display: inline-block;
 }
-.engine {
+.robot-connection {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  white-space: nowrap;
+  font-size: 12px;
+}
+.robot-connection button {
+  padding: 7px 12px;
+  border: 1px solid #d7deea;
+  border-radius: 8px;
+  background: #f6f9ff;
+  color: #1555a0;
+}
+.robot-connection button:hover:not(:disabled) {
+  background: #eaf2ff;
+}
+.robot-status {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  color: #55555c;
+}
+.robot-status i {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: #86868b;
+}
+.robot-connection[data-state="connected"] .robot-status i {
+  background: #30a46c;
+}
+.robot-connection[data-state="connecting"] .robot-status i,
+.robot-connection[data-state="disconnecting"] .robot-status i {
+  background: #bd7800;
+}
+.robot-connection[data-state="error"] .robot-status {
+  color: #ac3030;
+  white-space: normal;
+}
+.robot-connection[data-state="error"] .robot-status i {
+  flex: 0 0 6px;
+  background: #cf4545;
+}
+#robot-motion {
+  margin-bottom: 20px;
+}
+#robot-motion > label {
+  display: block;
+  margin-bottom: 8px;
+  font-size: 13px;
+  font-weight: 600;
+}
+#robot-motion > label span {
+  margin-left: 5px;
+  color: #656570;
   font-size: 11px;
-  color: #86868b;
+  font-weight: 400;
+}
+#robot-motion .actions {
+  margin-top: 10px;
+}
+#robot-motion-status {
+  margin: 8px 0 0;
+  color: #55555c;
+  font-size: 12px;
+}
+#target-preview-key {
+  margin: 8px 0 0;
+  color: #1555a0;
+  font-size: 12px;
+}
+#simulation-actions[hidden],
+#simulation-info[hidden] {
+  display: none;
 }
 main {
   display: grid;
@@ -426,8 +498,8 @@ input[type="range"] {
   border-radius: 4px;
   background: linear-gradient(
     to right,
-    #0071e3 var(--fill),
-    #e9e9ed var(--fill)
+    #0071e3 var(--fill, 0%),
+    #e9e9ed var(--fill, 0%)
   );
   cursor: pointer;
   margin: 6px 0;
@@ -600,9 +672,6 @@ input[type="range"]::-moz-range-thumb {
   header {
     padding: 0 20px;
   }
-  .engine {
-    display: none;
-  }
   main {
     grid-template-columns: minmax(0, 1fr) 305px;
   }
@@ -630,6 +699,16 @@ input[type="range"]::-moz-range-thumb {
   .mode {
     font-size: 10px;
     padding: 7px 10px;
+  }
+  .robot-connection {
+    margin-left: auto;
+    gap: 6px;
+  }
+  .robot-connection button {
+    padding-inline: 8px;
+  }
+  .robot-connection[data-state="error"] .robot-status {
+    max-width: 105px;
   }
   main {
     display: flex;
@@ -660,6 +739,11 @@ input[type="range"]::-moz-range-thumb {
   }
   .panel-bottom {
     padding-bottom: 5px;
+  }
+}
+@media (max-width: 400px) {
+  header .mode {
+    display: none;
   }
 }
 @media (prefers-reduced-motion: reduce) {

@@ -25,8 +25,9 @@ const CHARTS = [
   },
 ];
 
-const formatValue = (value) =>
-  (Math.abs(value) < 0.0005 ? 0 : value).toFixed(3);
+const formatValue = (value) => Number.isFinite(value)
+  ? (Math.abs(value) < 0.0005 ? 0 : value).toFixed(3)
+  : "—";
 
 export class MotorTelemetry {
   constructor(root, labels) {
@@ -36,8 +37,8 @@ export class MotorTelemetry {
     this.paused = false;
     root.innerHTML = `<div class="panel-heading"><div><div class="eyebrow">MOTOR TELEMETRY</div><h2>电机监控</h2></div><span class="data-source">仿真数据</span></div>
       <p class="monitor-intro">选择关节，查看最近 15 秒的运动与输出。</p>
-      <label class="motor-picker" for="monitor-joint"><span>监控关节</span><select id="monitor-joint">${labels.map((label, index) => `<option value="${index}">J${index + 1} · ${label}</option>`).join("")}</select></label>
-      <div class="monitor-state"><span id="monitor-state">实时采样</span><span>仿真时间 <output id="monitor-time">0.0 s</output></span></div>
+      <label class="motor-picker" for="monitor-joint"><span>监控电机</span><select id="monitor-joint">${labels.map((label, index) => `<option value="${index}">J${index + 1} · ${label}</option>`).join("")}</select></label>
+      <div class="monitor-state"><span id="monitor-state">实时采样</span><span><span id="monitor-clock">仿真时间</span> <output id="monitor-time">0.0 s</output></span></div>
       <div class="motor-charts">${CHARTS.map(
         (
           chart,
@@ -47,6 +48,7 @@ export class MotorTelemetry {
       ).join("")}</div>
       <p class="monitor-note">力矩为 MuJoCo 执行器输出，误差 = 目标 − 实际。<br>当前未连接真实电机。</p>`;
     this.select = root.querySelector("select");
+    this.armCount = labels.length;
     this.select.addEventListener("change", () => {
       this.selected = Number(this.select.value);
       this.render();
@@ -60,10 +62,25 @@ export class MotorTelemetry {
   }
 
   update(sample, paused) {
-    if (this.latest && sample.time < this.latest.time) this.history = [];
+    if (this.latest && (
+      sample.source !== this.latest.source ||
+      sample.session !== this.latest.session ||
+      sample.time < this.latest.time
+    )) this.history = [];
+    const gripperOption = this.select.options[this.armCount];
+    if (sample.joints.length > this.armCount && !gripperOption) {
+      this.select.add(new Option("夹爪", this.armCount));
+    } else if (sample.joints.length <= this.armCount && gripperOption) {
+      gripperOption.remove();
+      if (this.selected >= this.armCount) {
+        this.selected = 0;
+        this.select.value = "0";
+      }
+    }
     const last = this.history.at(-1);
     this.latest = sample;
     this.paused = paused;
+    this.disconnected = false;
     if (
       !paused &&
       (!last || sample.time - last.time >= SAMPLE_INTERVAL - 1e-6)
@@ -87,10 +104,24 @@ export class MotorTelemetry {
     this.render();
   }
 
+  markDisconnected() {
+    if (this.latest?.source !== "robot") return;
+    this.disconnected = true;
+    this.render();
+  }
+
   render() {
     if (this.root.hidden || !this.latest) return;
     const joint = this.latest.joints[this.selected];
-    this.root.querySelector("#monitor-state").textContent = this.paused
+    const live = this.latest.source === "robot";
+    this.root.querySelector(".data-source").textContent = live ? "真机数据" : "仿真数据";
+    this.root.querySelector("#monitor-clock").textContent = live ? "连接时长" : "仿真时间";
+    this.root.querySelector(".monitor-note").textContent = live
+      ? "力矩来自电机反馈。位置误差 = 已下发目标 − 实际角度。"
+      : "力矩为 MuJoCo 执行器输出，误差 = 目标 − 实际。";
+    this.root.querySelector("#monitor-state").textContent = this.disconnected
+      ? "已失联 · 历史保留"
+      : this.paused
       ? "已暂停 · 历史保留"
       : "实时采样";
     this.root.querySelector("#monitor-time").textContent =
@@ -99,11 +130,13 @@ export class MotorTelemetry {
       joint.target,
     );
     for (const chart of this.charts) {
+      const title = live && chart.key === "torque" ? "电机反馈力矩" : chart.title;
+      this.root.querySelector(`[data-chart="${chart.key}"] h3`).firstChild.nodeValue = `${title} `;
       this.root.querySelector(`#monitor-${chart.key}`).textContent =
         formatValue(joint[chart.key]);
       chart.canvas.setAttribute(
         "aria-label",
-        `J${this.selected + 1} ${chart.title}曲线（${chart.unit}）`,
+        `${joint.name} ${title}曲线（${chart.unit}）`,
       );
       this.draw(chart);
     }
@@ -135,7 +168,7 @@ export class MotorTelemetry {
             sample.joints[this.selected].target,
           ]
         : [sample.joints[this.selected][chart.key]],
-    );
+    ).filter(Number.isFinite);
     let low = Math.min(0, ...values),
       high = Math.max(0, ...values);
     const span = Math.max(high - low, chart.range);
@@ -188,18 +221,27 @@ export class MotorTelemetry {
       ctx.lineWidth = 1.6;
       ctx.setLineDash(line.dashed ? [4, 3] : []);
       ctx.beginPath();
-      samples.forEach((sample, index) => {
-        const px = x(sample.time),
-          py = y(sample.joints[this.selected][line.key]);
-        if (index === 0) ctx.moveTo(px, py);
-        else ctx.lineTo(px, py);
-      });
+      let previousValid = false;
+      let points = 0;
+      let lastPoint;
+      for (const sample of samples) {
+        const value = sample.joints[this.selected][line.key];
+        if (!Number.isFinite(value)) {
+          previousValid = false;
+          continue;
+        }
+        lastPoint = [x(sample.time), y(value)];
+        if (previousValid) ctx.lineTo(...lastPoint);
+        else ctx.moveTo(...lastPoint);
+        previousValid = true;
+        points++;
+      }
       ctx.stroke();
-      if (samples.length === 1) {
+      if (points === 1) {
         ctx.beginPath();
         ctx.arc(
-          x(samples[0].time) - 1,
-          y(samples[0].joints[this.selected][line.key]),
+          lastPoint[0] - 1,
+          lastPoint[1],
           2,
           0,
           Math.PI * 2,
