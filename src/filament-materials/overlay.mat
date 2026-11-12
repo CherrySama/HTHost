@@ -1,0 +1,17 @@
+// Filament 1.80.0: matc -p mobile -S -o overlay.filamat overlay.mat
+material {
+    name : PantheraOverlay,
+    shadingModel : unlit,
+    blending : transparent,
+    depthWrite : false,
+    requires : [ color ],
+    parameters : [{ type : float4, name : tint }]
+}
+
+fragment {
+    void material(inout MaterialInputs material) {
+        prepareMaterial(material);
+        vec4 tint = materialParams.tint * getColor();
+        material.baseColor = vec4(tint.rgb * tint.a, tint.a);
+    }
+}

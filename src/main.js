@@ -14,7 +14,8 @@ document.querySelector("#app").innerHTML = `
   <main><section id="viewport" aria-label="机械臂三维视图">
     <div class="scene-heading"><div class="eyebrow">YOUR ROBOT. YOUR SPACE.</div><h1>探索每一个自由度。</h1><p>Panthera HT <span> / </span> 六轴机械臂</p></div>
     <div class="view-tools" role="group" aria-label="视图显示">
-      <button id="home" title="恢复默认视角">⌖ <span>默认视角</span></button><button id="grid" aria-pressed="true">▦ <span>网格</span></button>
+      <button id="home" title="恢复默认视角">⌖ <span>默认视角</span></button>
+      <button id="grid" aria-pressed="true">网格</button>
       <button data-overlay="collision" aria-pressed="false" disabled>碰撞</button>
       <button data-overlay="inertia" aria-pressed="false" disabled>惯量</button>
       <button data-overlay="centerOfMass" aria-pressed="false" disabled>质心</button>
@@ -348,6 +349,7 @@ function updateMotionControls() {
   const state = robotConnection.dataset.state;
   const live = state === "connected" && Boolean(robotPose);
   const realView = Boolean(robotPose);
+  viewer.setRobotView(realView);
   const mode = robotPose?.mode ?? "position";
   const switchingTo = requestedMode || robotPose?.pendingMode;
   const switching = Boolean(switchingTo);
@@ -727,10 +729,12 @@ tabs.forEach((tab, index) => {
   };
 });
 try {
-  viewer = new Viewer(document.querySelector("#viewport"));
-  await simulation.init((message) => {
-    document.querySelector("#load-message").textContent = message;
-  });
+  [viewer] = await Promise.all([
+    Viewer.create(document.querySelector("#viewport")),
+    simulation.init((message) => {
+      document.querySelector("#load-message").textContent = message;
+    }),
+  ]);
   viewer.load(
     simulation.model,
     simulation.highlightBodies,

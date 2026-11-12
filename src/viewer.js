@@ -1,6 +1,7 @@
 import * as THREE from "three";
 import { OrbitControls } from "three/addons/controls/OrbitControls.js";
 import { mergeGeometries } from "three/addons/utils/BufferGeometryUtils.js";
+import { FilamentRenderer } from "./filament-renderer.js";
 
 const UP = new THREE.Vector3(0, 1, 0);
 const markerMaterial = { transparent: true, depthTest: false, depthWrite: false };
@@ -54,14 +55,13 @@ function centerOfMassGeometry() {
 }
 
 export class Viewer {
-  constructor(container) {
+  static async create(container) {
+    return new Viewer(container, await FilamentRenderer.create());
+  }
+
+  constructor(container, renderer) {
     this.scene = new THREE.Scene();
-    this.scene.background = new THREE.Color("#f5f5f7");
-    this.renderer = new THREE.WebGLRenderer({ antialias: true });
-    this.renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
-    this.renderer.shadowMap.enabled = true;
-    this.renderer.shadowMap.type = THREE.PCFSoftShadowMap;
-    this.renderer.outputColorSpace = THREE.SRGBColorSpace;
+    this.renderer = renderer;
     container.appendChild(this.renderer.domElement);
     this.camera = new THREE.PerspectiveCamera(36, 1, 0.01, 30);
     this.camera.up.set(0, 0, 1);
@@ -75,22 +75,6 @@ export class Viewer {
     this.controls.maxDistance = 4;
     this.controls.maxPolarAngle = Math.PI * 0.49;
     this.home();
-    this.scene.add(new THREE.HemisphereLight(0xffffff, 0xa2a7b5, 2.5));
-    const light = new THREE.DirectionalLight(0xffffff, 3.2);
-    light.position.set(1, -1, 2);
-    light.castShadow = true;
-    light.shadow.mapSize.set(2048, 2048);
-    Object.assign(light.shadow.camera, {
-      left: -1,
-      right: 1,
-      top: 1,
-      bottom: -1,
-      near: 0.1,
-      far: 5,
-    });
-    light.shadow.bias = -0.0001;
-    light.shadow.normalBias = 0.002;
-    this.scene.add(light);
     const ground = new THREE.Mesh(
       new THREE.PlaneGeometry(200, 200),
       new THREE.MeshStandardMaterial({ color: "#f5f5f7", roughness: 0.95 }),
@@ -98,7 +82,7 @@ export class Viewer {
     ground.position.z = -0.002;
     ground.receiveShadow = true;
     this.scene.add(ground);
-    this.grid = new THREE.GridHelper(3, 30, "#ccd0d8", "#e1e3e8");
+    this.grid = new THREE.GridHelper(3, 30, "#a5adbb", "#b8bfcb");
     this.grid.rotation.x = Math.PI / 2;
     this.grid.position.z = -0.001;
     this.grid.material.transparent = true;
@@ -114,10 +98,14 @@ export class Viewer {
     new ResizeObserver(() => {
       const { width, height } = container.getBoundingClientRect();
       this.renderer.setSize(width, height);
-      this.camera.aspect = width / height;
+      this.camera.aspect = width / Math.max(1, height);
       this.camera.updateProjectionMatrix();
       this.dirty = true;
     }).observe(container);
+  }
+
+  setRobotView(active) {
+    if (this.renderer.setRobotView(active)) this.dirty = true;
   }
 
   home() {
@@ -131,8 +119,16 @@ export class Viewer {
     const canvas = this.renderer.domElement;
     const makeMarker = (radius, color, wireframe = false) => {
       const geometry = new THREE.SphereGeometry(radius, 16, 12);
-      const material = new THREE.MeshBasicMaterial({ ...markerMaterial, color, wireframe });
-      const mesh = new THREE.Mesh(geometry, material);
+      let mesh;
+      if (wireframe) {
+        mesh = new THREE.LineSegments(
+          new THREE.WireframeGeometry(geometry),
+          new THREE.LineBasicMaterial({ ...markerMaterial, color }),
+        );
+        geometry.dispose();
+      } else {
+        mesh = new THREE.Mesh(geometry, new THREE.MeshBasicMaterial({ ...markerMaterial, color }));
+      }
       mesh.renderOrder = 10;
       return mesh;
     };
@@ -692,8 +688,9 @@ export class Viewer {
       });
       this.updateOverlays(data, bodyPositions, bodyRotations);
     }
-    this.renderer.render(this.scene, this.camera);
-    this.lastRender = now;
-    this.dirty = this.renderer.info.render.calls === 0;
+    if (this.renderer.render(this.scene, this.camera)) {
+      this.lastRender = now;
+      this.dirty = false;
+    }
   }
 }

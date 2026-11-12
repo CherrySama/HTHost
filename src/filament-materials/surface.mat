@@ -1,0 +1,23 @@
+// Filament 1.80.0: matc -p mobile -S -TBLEND=opaque -o surface.filamat surface.mat
+// Also compile with -TBLEND=fade for the translucent surface.
+material {
+    name : PantheraSurface,
+    shadingModel : lit,
+    blending : ${BLEND},
+    parameters : [
+        { type : float4, name : tint },
+        { type : float, name : roughness },
+        { type : float, name : metallic },
+        { type : float4, name : glow }
+    ]
+}
+
+fragment {
+    void material(inout MaterialInputs material) {
+        prepareMaterial(material);
+        material.baseColor = materialParams.tint;
+        material.roughness = materialParams.roughness;
+        material.metallic = materialParams.metallic;
+        material.emissive = materialParams.glow;
+    }
+}
