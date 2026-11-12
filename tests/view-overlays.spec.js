@@ -13,7 +13,9 @@ test("视图开关独立切换，显示层跟随 MuJoCo 姿态", async ({ page }
   page.on("pageerror", (error) => errors.push(error.message));
   await page.goto("/");
   await expect(page.locator("#loading")).toBeHidden({ timeout: 60000 });
-  await page.locator("#pause").click();
+  await page.evaluate(() => {
+    window.panthera.simulation.paused = true;
+  });
 
   const modelAppearance = () => page.evaluate(() => {
     const { items } = panthera.viewer;

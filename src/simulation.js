@@ -2,6 +2,7 @@ import loadMujoco from "@mujoco/mujoco";
 import wasmUrl from "@mujoco/mujoco/mujoco.wasm?url";
 import sceneUrl from "../models/panthera.xml?url";
 import { gripperOpening } from "./gripper-calibration.js";
+import { solveTcpPosition } from "./tcp-ik.js";
 
 const assets = import.meta.glob(
   "../Panthera-HT_SDK/panthera_python/Panthera-HT_description_V1.1.0/mujoco/meshes/obj/*.obj",
@@ -95,6 +96,10 @@ export class Simulation {
       };
     });
     this.targets = new Float64Array(6);
+    const bodyType = this.mj.mjtObj.mjOBJ_BODY.value;
+    this.tcpBodies = ["link6", "gripper_center_link"].map((name) =>
+      this.mj.mj_name2id(this.model, bodyType, name),
+    );
     this.gripperJoints = ["L", "R"].map((side) => {
       const id = this.mj.mj_name2id(
         this.model,
@@ -127,15 +132,15 @@ export class Simulation {
       (joint) => this.model.jnt_bodyid[joint.id],
     );
     this.paused = false;
-    this.reset(0);
+    this.reset();
   }
 
-  reset(gripperTarget = 2) {
+  reset() {
     this.accumulator = 0;
     this.mj.mj_resetData(this.model, this.data);
     this.targets.fill(0);
-    this.gripperTarget = gripperTarget;
-    this.writeGripperPose(this.data, gripperTarget);
+    this.gripperTarget = 0;
+    this.writeGripperPose(this.data, this.gripperTarget);
     this.mj.mj_forward(this.model, this.data);
   }
 
@@ -163,6 +168,32 @@ export class Simulation {
     this.writePose(this.previewData, positions, gripper);
     this.mj.mj_kinematics(this.model, this.previewData);
     return this.previewData;
+  }
+
+  getTcpPosition(data, hasGripper = true) {
+    const offset = this.tcpBodies[Number(hasGripper)] * 3;
+    return Array.from(data.xpos.subarray(offset, offset + 3));
+  }
+
+  solveTcp(target, initial, limits, hasGripper) {
+    this.ikData ??= new this.mj.MjData(this.model);
+    const data = this.ikData;
+    return solveTcpPosition((angles) => {
+      this.writePose(data, angles);
+      this.mj.mj_kinematics(this.model, data);
+      const position = this.getTcpPosition(data, hasGripper);
+      const anchors = data.xanchor;
+      const axes = data.xaxis;
+      const columns = this.joints.map(({ id }) => {
+        const offset = id * 3;
+        const x = position[0] - anchors[offset];
+        const y = position[1] - anchors[offset + 1];
+        const z = position[2] - anchors[offset + 2];
+        const [ax, ay, az] = axes.subarray(offset, offset + 3);
+        return [ay * z - az * y, az * x - ax * z, ax * y - ay * x];
+      });
+      return { position, columns };
+    }, initial, limits, target);
   }
 
   writePose(data, positions, gripper) {

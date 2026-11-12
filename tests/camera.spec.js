@@ -5,7 +5,9 @@ test("腕部相机按固定安装姿态渲染并随 J6 运动", async ({ page })
   page.on("pageerror", (error) => errors.push(error.message));
   await page.goto("/");
   await expect(page.locator("#loading")).toBeHidden({ timeout: 60000 });
-  await page.locator("#pause").click();
+  await page.evaluate(() => {
+    window.panthera.simulation.paused = true;
+  });
   const result = await page.evaluate(() => {
     const { simulation: sim, viewer } = window.panthera;
     const camera = sim.mj.mj_name2id(

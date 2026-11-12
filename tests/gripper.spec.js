@@ -5,7 +5,9 @@ test("夹爪标定点、对称开合、端点和复位", async ({ page }) => {
   page.on("pageerror", (error) => errors.push(error.message));
   await page.goto("/");
   await expect(page.locator("#loading")).toBeHidden({ timeout: 60000 });
-  await page.locator("#pause").click();
+  await page.evaluate(() => {
+    window.panthera.simulation.paused = true;
+  });
   await page.locator("#gripper-angle").fill("1");
   await page.locator("#gripper-angle").press("Enter");
   await expect(page.locator("#gripper-target-opening")).toHaveText(
@@ -47,7 +49,10 @@ test("夹爪标定点、对称开合、端点和复位", async ({ page }) => {
   await page.locator("#reset").click();
   expect(
     await page.evaluate(() => panthera.simulation.getGripperState().opening),
-  ).toBe(82);
+  ).toBe(0);
+  await expect(page.locator("#gripper-angle")).toHaveValue("0.00");
+  await expect(page.locator("#gripper-opening")).toHaveText("0.00 mm");
+  await expect(page.locator("#gripper-target-opening")).toHaveText("目标总开口 0.00 mm");
   expect(errors).toEqual([]);
 });
 

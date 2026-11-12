@@ -25,8 +25,19 @@ document.querySelector("#app").innerHTML = `
     <div class="scene-footer"><span><i class="live-dot"></i><span id="status">正在加载</span></span><span>拖动旋转 · 滚轮缩放 · 右键平移</span></div>
   </section>
   <aside><nav class="sidebar-tabs" role="tablist" aria-label="侧边面板"><button id="control-tab" role="tab" aria-selected="true" aria-controls="control-panel">关节控制</button><button id="monitor-tab" role="tab" aria-selected="false" aria-controls="motor-monitor" tabindex="-1" disabled>电机监控</button></nav>
-    <section class="sidebar-panel" id="control-panel" role="tabpanel" aria-labelledby="control-tab"><div class="panel-heading"><div><div class="eyebrow">JOINT CONTROL</div><h2>关节控制</h2></div><span class="unit">rad</span></div>
+    <section class="sidebar-panel" id="control-panel" role="tabpanel" aria-labelledby="control-tab">
+    <div class="panel-heading">
+      <div><div class="eyebrow">JOINT CONTROL</div><h2>关节控制</h2></div>
+      <div class="control-heading-actions">
+        <button id="tcp-drag" type="button" aria-pressed="false" disabled>末端拖拽</button>
+        <span class="unit">rad</span>
+      </div>
+    </div>
     <p id="joint-intro" class="intro">调整目标角度，探索机械臂的运动。</p>
+    <div id="tcp-feedback" class="tcp-feedback" hidden>
+      <span>拖动绿色末端手柄 · Shift 调整深度</span>
+      <output id="tcp-distance" aria-label="末端到目标的距离" aria-live="off"></output>
+    </div>
     <section id="robot-motion" hidden>
       <div class="robot-mode-options" role="group" aria-label="真机控制模式">
         <button type="button" data-mode="position" aria-pressed="true">位置控制</button>
@@ -49,7 +60,7 @@ document.querySelector("#app").innerHTML = `
     <div class="joint-input"><input id="gripper-slider" type="range" aria-label="夹爪电机角度滑条（rad）" min="0" max="2" step="0.01" value="0"><div class="number-wrap"><input id="gripper-angle" type="number" aria-label="夹爪电机目标（rad）" min="0" max="2" step="0.01" value="0"></div></div>
     <div class="limits"><span>闭合 · 0 rad</span><span>张开 · 2 rad</span></div><p class="gripper-summary" id="gripper-target-opening">目标总开口 0.00 mm</p>
     <div class="gripper-buttons"><button id="gripper-close" disabled>闭合</button><button id="gripper-open" disabled>张开</button></div></section>
-    <div id="simulation-actions" class="actions"><button id="reset" disabled>↺　全部复位</button><button id="pause" disabled aria-pressed="false">暂停</button></div>
+    <div id="simulation-actions" class="actions"><button id="reset" disabled>↺　全部复位</button></div>
     <div id="simulation-info" class="info"><span class="info-icon">◎</span><div><strong>在虚拟空间，自由探索。</strong><p>自碰撞物理阻挡 · 关节限位保护<br>仅控制虚拟机械臂</p></div></div>
     </section><section class="sidebar-panel" id="motor-monitor" role="tabpanel" aria-labelledby="monitor-tab" hidden></section>
     <div class="panel-bottom"><span>Panthera HT</span><span>6 DOF <b>·</b> V1.1.0</span></div>
@@ -176,6 +187,77 @@ const gripperInput = document.querySelector("#gripper-angle");
 const gripperClose = document.querySelector("#gripper-close");
 const gripperOpen = document.querySelector("#gripper-open");
 const gripperActual = document.querySelector("#gripper-opening");
+const tcpButton = document.querySelector("#tcp-drag");
+const tcpFeedback = document.querySelector("#tcp-feedback");
+const tcpDistance = document.querySelector("#tcp-distance");
+let tcpEnabled = false;
+let tcpGoal;
+let tcpQueuedGoal;
+let tcpSeed;
+let tcpReachable = true;
+
+function clearTcpGoal() {
+  tcpGoal = tcpQueuedGoal = tcpSeed = undefined;
+  tcpReachable = true;
+  viewer?.cancelTcpDrag();
+}
+
+function setTcpEnabled(enabled) {
+  tcpEnabled = enabled;
+  tcpButton.setAttribute("aria-pressed", String(enabled));
+  tcpFeedback.hidden = !enabled;
+  if (!enabled) {
+    clearTcpGoal();
+    viewer.updateTcpMarkers(null);
+  }
+}
+
+function tcpHasGripper() {
+  return !robotPose || Number.isFinite(robotPose.gripper);
+}
+
+function applyTcpGoal() {
+  const goal = tcpQueuedGoal;
+  tcpQueuedGoal = undefined;
+  tcpGoal = goal;
+  const limits = robotPose?.limits ?? simulation.joints.map(({ min, max }) => [min, max]);
+  const angles = simulation.solveTcp(goal, tcpSeed, limits, tcpHasGripper());
+  tcpReachable = Boolean(angles);
+  if (angles && angles.some((angle, index) => Math.abs(angle - tcpSeed[index]) > 1e-7)) {
+    tcpSeed = angles;
+    if (robotPose) {
+      robotTargets = angles;
+      controls.forEach((control, index) => {
+        editedRobotJoints.add(index);
+        control.display(angles[index]);
+      });
+      positionCommandId = undefined;
+      showMotionMessage("");
+    } else {
+      controls.forEach((control, index) => {
+        simulation.setTarget(index, angles[index]);
+        control.display(simulation.targets[index]);
+      });
+    }
+  }
+  if (robotPose) updateMotionControls();
+}
+
+function renderTcpFeedback(data) {
+  const actual = simulation.getTcpPosition(data, tcpHasGripper());
+  viewer.updateTcpMarkers(actual, tcpGoal, tcpReachable);
+  let text = "";
+  if (tcpGoal) {
+    const distance = Math.hypot(...tcpGoal.map((value, i) => value - actual[i])) * 1000;
+    text = `${tcpReachable ? "末端误差" : "目标不可达 · 距离"} ${distance.toFixed(1)} mm`;
+  }
+  if (tcpDistance.textContent !== text) tcpDistance.textContent = text;
+}
+
+tcpButton.onclick = () => {
+  setTcpEnabled(!tcpEnabled);
+  updateMotionControls();
+};
 
 function receiveRobotPose(status) {
   const newSession = robotPose?.session !== status.session;
@@ -186,6 +268,7 @@ function receiveRobotPose(status) {
   robotPose = status;
   if (newSession || mode === requestedMode || modeRejected) requestedMode = undefined;
   if (newSession || modeChanged) {
+    if (tcpEnabled) setTcpEnabled(false);
     positionCommandId = undefined;
     const holdTargets = status.motors.slice(0, labels.length).map((motor) => motor.target);
     robotHasCommand = mode === "position" && holdTargets.every(Number.isFinite);
@@ -269,6 +352,10 @@ function updateMotionControls() {
   const switchingTo = requestedMode || robotPose?.pendingMode;
   const switching = Boolean(switchingTo);
   const positionReady = live && !switching && mode === "position" && !sendingPosition;
+  const tcpAvailable = realView ? live && !switching && mode === "position" : state !== "connecting";
+  tcpButton.disabled = !tcpAvailable;
+  if (!tcpAvailable && tcpEnabled) setTcpEnabled(false);
+  viewer.tcpInteractive = tcpEnabled && !sendingPosition;
   document.querySelector(".mode").lastChild.textContent = realView ? " 真机视图" : " 本地仿真";
   document.querySelector("#joint-intro").textContent = realView
     ? (state === "homing" ? "正在回零，到位后自动断开。"
@@ -289,7 +376,8 @@ function updateMotionControls() {
   document.querySelector("#simulation-actions").hidden = realView;
   document.querySelector("#simulation-info").hidden = realView;
   returnToSimulation.hidden = !realView || state !== "error";
-  sendPosition.disabled = !positionReady || !(editedRobotJoints.size || gripperEdited);
+  sendPosition.disabled = !positionReady || !(editedRobotJoints.size || gripperEdited)
+    || (tcpEnabled && !tcpReachable);
   resetRobot.disabled = !positionReady ||
     robotPose.limits.some(([lower, upper]) => lower > 0 || upper < 0) ||
     Boolean(robotPose.gripperLimits &&
@@ -368,6 +456,7 @@ returnToSimulation.onclick = () => {
 };
 resetRobot.onclick = () => {
   if (resetRobot.disabled) return;
+  clearTcpGoal();
   positionCommandId = undefined;
   controls.forEach((control, index) => {
     robotTargets[index] = 0;
@@ -383,7 +472,9 @@ resetRobot.onclick = () => {
   updateMotionControls();
 };
 sendPosition.onclick = async () => {
+  if (tcpQueuedGoal) applyTcpGoal();
   if (sendPosition.disabled || !speedInput.reportValidity()) return;
+  viewer.cancelTcpDrag();
   const { session } = robotPose;
   const positions = editedRobotJoints.size ? robotTargets.slice() : undefined;
   const gripper = gripperEdited ? robotGripperTarget : undefined;
@@ -455,6 +546,7 @@ function buildControls() {
     };
     const update = (value, preserveInput = false) => {
       if (!robotPose) {
+        if (tcpGoal || tcpQueuedGoal) clearTcpGoal();
         simulation.setTarget(i, value);
         display(simulation.targets[i]);
         return;
@@ -463,6 +555,7 @@ function buildControls() {
         const [lower, upper] = robotPose.limits[i];
         const radians = Math.max(lower, Math.min(upper, value));
         if (radians !== robotTargets[i]) {
+          if (tcpGoal || tcpQueuedGoal) clearTcpGoal();
           robotTargets[i] = radians;
           editedRobotJoints.add(i);
           positionCommandId = undefined;
@@ -590,10 +683,11 @@ overlayButtons.forEach((button) => {
 });
 document.querySelector("#reset").onclick = () => {
   viewer.clearJointHighlight();
+  clearTcpGoal();
   simulation.reset();
   controls.forEach((control) => control.update(0));
   telemetry.reset(simulation.getMotorTelemetry());
-  updateGripper(2);
+  displayGripperTarget(simulation.gripperTarget);
 };
 window.addEventListener("pointerup", () => viewer?.endJointInteraction());
 window.addEventListener("pointercancel", () => viewer?.endJointInteraction());
@@ -632,12 +726,6 @@ tabs.forEach((tab, index) => {
     }
   };
 });
-document.querySelector("#pause").onclick = (event) => {
-  simulation.paused = !simulation.paused;
-  event.currentTarget.textContent = simulation.paused ? "继续" : "暂停";
-  event.currentTarget.setAttribute("aria-pressed", String(simulation.paused));
-};
-
 try {
   viewer = new Viewer(document.querySelector("#viewport"));
   await simulation.init((message) => {
@@ -648,6 +736,15 @@ try {
     simulation.highlightBodies,
     simulation.mj.mjtJoint.mjJNT_HINGE.value,
   );
+  viewer.setupTcpDrag((fromTarget) => {
+    tcpQueuedGoal = undefined;
+    if (!fromTarget || !tcpSeed) {
+      tcpSeed = robotPose?.positions.slice() ??
+        simulation.joints.map(({ q }) => simulation.data.qpos[q]);
+    }
+  }, (goal) => {
+    tcpQueuedGoal = goal;
+  });
   overlayButtons.forEach((button) => (button.disabled = false));
   buildControls();
   displayGripperTarget(simulation.gripperTarget);
@@ -661,9 +758,9 @@ try {
   document.querySelector("#monitor-tab").disabled = false;
   document.querySelector("#loading").hidden = true;
   document.querySelector("#reset").disabled = false;
-  document.querySelector("#pause").disabled = false;
   ready = true;
   showRobotStatus({ state: "disconnected" });
+  updateMotionControls();
   void refreshRobotStatus("GET", true);
   // Diagnostic access for browser verification.
   window.panthera = { simulation, viewer, telemetry };
@@ -679,7 +776,9 @@ let previous = performance.now(),
 function frame(now) {
   requestAnimationFrame(frame);
   if (ready) {
+    if (tcpQueuedGoal) applyTcpGoal();
     if (!robotPose) simulation.advance(document.hidden ? 0 : (now - previous) / 1000);
+    if (tcpEnabled) renderTcpFeedback(robotPose ? simulation.robotData : simulation.data);
     if (now - lastUI > 100) {
       if (robotPose && Number.isFinite(robotPose.gripper)) {
         gripperActual.textContent = `${gripperOpening(robotPose.gripper).toFixed(2)} mm`;

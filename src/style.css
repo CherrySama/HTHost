@@ -311,6 +311,37 @@ aside {
   align-items: center;
   justify-content: space-between;
 }
+.control-heading-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+#tcp-drag {
+  border: 1px solid #e4e4e8;
+  border-radius: 7px;
+  background: #f7f7f9;
+  color: #64646c;
+  padding: 6px 9px;
+  font-size: 11px;
+  white-space: nowrap;
+}
+#tcp-drag:enabled:hover,
+#tcp-drag[aria-pressed="true"] {
+  border-color: #b9d7fb;
+  background: #e5f1ff;
+  color: #005bbf;
+}
+.tcp-feedback {
+  margin: -12px 0 18px;
+  color: #64646c;
+  font-size: 11px;
+  line-height: 1.6;
+}
+.tcp-feedback output {
+  display: block;
+  color: #1555a0;
+  font-variant-numeric: tabular-nums;
+}
 .sidebar-panel {
   flex-shrink: 0;
 }

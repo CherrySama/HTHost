@@ -58,9 +58,9 @@ test("电机曲线的实数据、关节切换、暂停及复位", async ({ page 
   expect(actual.torque).toBe(actual.engineTorque);
   expect(actual.error).toBe(actual.engineError);
 
-  await page.locator("#control-tab").click();
-  await page.locator("#pause").click();
-  await page.locator("#monitor-tab").click();
+  await page.evaluate(() => {
+    window.panthera.simulation.paused = true;
+  });
   await expect(page.locator("#monitor-state")).toContainText("已暂停");
   const count = await page.evaluate(() => panthera.telemetry.history.length);
   await page.waitForTimeout(350);

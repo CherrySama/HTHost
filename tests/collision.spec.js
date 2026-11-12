@@ -5,7 +5,9 @@ test("自碰撞物理阻挡、零位稳定和反向脱离", async ({ page }) => 
   page.on("pageerror", (error) => errors.push(error.message));
   await page.goto("/");
   await expect(page.locator("#loading")).toBeHidden({ timeout: 60000 });
-  await page.locator("#pause").click();
+  await page.evaluate(() => {
+    window.panthera.simulation.paused = true;
+  });
   const result = await page.evaluate(() => {
     const sim = window.panthera.simulation;
     const run = (seconds) => {
@@ -18,7 +20,7 @@ test("自碰撞物理阻挡、零位稳定和反向脱离", async ({ page }) => 
       }
       sim.paused = true;
       return {
-        actual: Array.from(sim.data.qpos),
+        actual: sim.joints.map(({ q }) => sim.data.qpos[q]),
         contacts: sim.getSelfContacts().length,
         penetration,
         velocity: Math.max(...Array.from(sim.data.qvel).map(Math.abs)),

@@ -1,6 +1,6 @@
 import { test, expect } from "@playwright/test";
 
-test("模型、六轴控制、限位、暂停与复位", async ({ page }) => {
+test("模型、六轴控制、限位与复位", async ({ page }) => {
   const errors = [];
   page.on("pageerror", (error) => errors.push(error.message));
   await page.goto("/");
@@ -26,7 +26,9 @@ test("模型、六轴控制、限位、暂停与复位", async ({ page }) => {
   );
 
   // Advance the actual MuJoCo controller deterministically instead of relying on rendering speed.
-  await page.getByRole("button", { name: "暂停", exact: true }).click();
+  await page.evaluate(() => {
+    window.panthera.simulation.paused = true;
+  });
   for (let i = 0; i < 6; i++) {
     await page.getByRole("button", { name: /全部复位/ }).click();
     const input = page.locator(`#angle-${i}`);
@@ -70,17 +72,13 @@ test("模型、六轴控制、限位、暂停与复位", async ({ page }) => {
     0.5,
   );
 
-  const frozen = await page.evaluate(() => {
-    const sim = window.panthera.simulation;
-    const time = sim.data.time;
-    sim.advance(0.05);
-    return sim.data.time === time;
-  });
-  expect(frozen).toBe(true);
   await page.getByRole("button", { name: /全部复位/ }).click();
   expect(
-    await page.evaluate(() => Array.from(window.panthera.simulation.data.qpos)),
-  ).toEqual([0, 0, 0, 0, 0, 0, 0, 0]);
+    await page.evaluate(() => {
+      const sim = window.panthera.simulation;
+      return sim.joints.map(({ q }) => sim.data.qpos[q]);
+    }),
+  ).toEqual([0, 0, 0, 0, 0, 0]);
   await page.locator("#grid").click();
   await expect(page.locator("#grid")).toHaveAttribute("aria-pressed", "false");
   await page.locator("#home").click();

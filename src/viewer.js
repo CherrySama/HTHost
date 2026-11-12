@@ -127,6 +127,169 @@ export class Viewer {
     this.controls.update();
   }
 
+  setupTcpDrag(onStart, onTarget) {
+    const canvas = this.renderer.domElement;
+    const makeMarker = (radius, color, wireframe = false) => {
+      const geometry = new THREE.SphereGeometry(radius, 16, 12);
+      const material = new THREE.MeshBasicMaterial({ ...markerMaterial, color, wireframe });
+      const mesh = new THREE.Mesh(geometry, material);
+      mesh.renderOrder = 10;
+      return mesh;
+    };
+    this.tcpActual = makeMarker(0.012, "#009d70", true);
+    this.tcpTarget = makeMarker(0.010, "#e98521");
+    this.tcpLine = new THREE.Line(
+      new THREE.BufferGeometry().setAttribute("position", new THREE.Float32BufferAttribute(6, 3)),
+      new THREE.LineBasicMaterial({ ...markerMaterial, color: "#d5751f" }),
+    );
+    this.tcpLine.renderOrder = 9;
+    this.tcpMarkers = new THREE.Group();
+    this.tcpMarkers.add(this.tcpActual, this.tcpTarget, this.tcpLine);
+    this.tcpMarkers.visible = false;
+    this.scene.add(this.tcpMarkers);
+    this.tcpRay = new THREE.Raycaster();
+
+    canvas.addEventListener("pointerdown", (event) => {
+      if (!this.tcpInteractive || !this.tcpMarkers.visible || this.tcpDrag || event.button !== 0) return;
+      const marker = this.pickTcpMarker(event);
+      if (!marker) return;
+      event.preventDefault();
+      event.stopImmediatePropagation();
+      onStart(marker === this.tcpTarget);
+      this.tcpDrag = { pointer: event.pointerId };
+      this.anchorTcpDrag(event, marker.position);
+      this.controls.enabled = false;
+      canvas.setPointerCapture(event.pointerId);
+      canvas.style.cursor = "grabbing";
+    }, true);
+    canvas.addEventListener("pointermove", (event) => {
+      const drag = this.tcpDrag;
+      if (!drag && this.tcpInteractive && this.tcpMarkers.visible) {
+        canvas.style.cursor = this.pickTcpMarker(event) ? "grab" : "";
+      }
+      if (!drag || drag.pointer !== event.pointerId) return;
+      event.preventDefault();
+      event.stopImmediatePropagation();
+      if (drag.depth !== event.shiftKey) this.anchorTcpDrag(event, drag.target);
+      if (drag.depth) {
+        const offset = (drag.startY - event.clientY) * drag.metresPerPixel;
+        drag.target.copy(drag.origin).addScaledVector(drag.normal, offset);
+      } else {
+        const point = this.tcpPointerRay(event).intersectPlane(drag.plane, new THREE.Vector3());
+        if (point) drag.target.copy(point).add(drag.offset);
+      }
+      onTarget(drag.target.toArray());
+    }, true);
+    const endDrag = (event) => {
+      if (this.tcpDrag?.pointer !== event.pointerId) return;
+      event.stopImmediatePropagation();
+      this.cancelTcpDrag();
+    };
+    canvas.addEventListener("pointerup", endDrag, true);
+    canvas.addEventListener("pointercancel", endDrag, true);
+    canvas.addEventListener("lostpointercapture", endDrag);
+    window.addEventListener("blur", () => this.cancelTcpDrag());
+  }
+
+  tcpPointerRay(event) {
+    const { left, top, width, height } = this.renderer.domElement.getBoundingClientRect();
+    this.camera.updateMatrixWorld();
+    this.tcpRay.setFromCamera({
+      x: (event.clientX - left) * 2 / width - 1,
+      y: 1 - (event.clientY - top) * 2 / height,
+    }, this.camera);
+    return this.tcpRay.ray;
+  }
+
+  pickTcpMarker(event) {
+    const { left, top, width, height } = this.renderer.domElement.getBoundingClientRect();
+    this.camera.updateMatrixWorld();
+    let nearest;
+    let distance = 18;
+    for (const marker of [this.tcpTarget, this.tcpActual]) {
+      if (!marker.visible) continue;
+      const point = marker.position.clone().project(this.camera);
+      if (point.z < -1 || point.z > 1) continue;
+      const pixels = Math.hypot(
+        left + (point.x + 1) * width / 2 - event.clientX,
+        top + (1 - point.y) * height / 2 - event.clientY,
+      );
+      if (pixels < distance) {
+        distance = pixels;
+        nearest = marker;
+      }
+    }
+    return nearest;
+  }
+
+  anchorTcpDrag(event, target) {
+    const drag = this.tcpDrag;
+    const origin = target.clone();
+    const ray = this.tcpPointerRay(event);
+    const normal = this.camera.getWorldDirection(new THREE.Vector3());
+    const plane = new THREE.Plane().setFromNormalAndCoplanarPoint(normal, origin);
+    const point = ray.intersectPlane(plane, new THREE.Vector3());
+    const distance = origin.clone().sub(this.camera.position).dot(normal);
+    Object.assign(drag, {
+      origin,
+      target: origin.clone(),
+      depth: event.shiftKey,
+      startY: event.clientY,
+      metresPerPixel: 2 * distance * Math.tan(THREE.MathUtils.degToRad(this.camera.fov / 2))
+        / this.renderer.domElement.clientHeight,
+      normal,
+      plane,
+      offset: point ? origin.clone().sub(point) : new THREE.Vector3(),
+    });
+  }
+
+  cancelTcpDrag() {
+    if (!this.tcpDrag) return;
+    const { pointer } = this.tcpDrag;
+    this.tcpDrag = null;
+    this.controls.enabled = true;
+    const canvas = this.renderer.domElement;
+    if (canvas.hasPointerCapture(pointer)) canvas.releasePointerCapture(pointer);
+    canvas.style.cursor = "";
+  }
+
+  updateTcpMarkers(actual, target, reachable) {
+    const show = Boolean(actual);
+    if (this.tcpMarkers.visible !== show) this.dirty = true;
+    this.tcpMarkers.visible = show;
+    if (!show) {
+      this.renderer.domElement.style.cursor = "";
+      return;
+    }
+    const move = (marker, position) => {
+      const { x, y, z } = marker.position;
+      if (Math.hypot(x - position[0], y - position[1], z - position[2]) < 1e-5) return false;
+      marker.position.fromArray(position);
+      this.dirty = true;
+      return true;
+    };
+    const moved = move(this.tcpActual, actual);
+    const targetVisibilityChanged = this.tcpTarget.visible !== Boolean(target);
+    if (targetVisibilityChanged) this.dirty = true;
+    this.tcpTarget.visible = this.tcpLine.visible = Boolean(target);
+    if (!target) return;
+    const targetMoved = move(this.tcpTarget, target);
+    if (moved || targetMoved || targetVisibilityChanged) {
+      const vertices = this.tcpLine.geometry.getAttribute("position");
+      vertices.setXYZ(0, ...actual);
+      vertices.setXYZ(1, ...target);
+      vertices.needsUpdate = true;
+      this.tcpLine.geometry.computeBoundingSphere();
+    }
+    if (this.tcpReachable !== reachable) {
+      const color = reachable ? "#e98521" : "#cb3c38";
+      this.tcpTarget.material.color.set(color);
+      this.tcpLine.material.color.set(color);
+      this.tcpReachable = reachable;
+      this.dirty = true;
+    }
+  }
+
   load(model, highlightBodies = [], hingeJointType) {
     this.model = model;
     this.highlightBodies = highlightBodies;
@@ -504,7 +667,7 @@ export class Viewer {
   render(data) {
     const now = performance.now();
     this.updateJointHighlight(now);
-    this.controls.update();
+    if (!this.tcpDrag) this.controls.update();
     const bodyPositions = data?.xpos;
     const bodyRotations = data?.xquat;
     if (data) {
