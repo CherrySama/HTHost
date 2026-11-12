@@ -28,6 +28,12 @@ document.querySelector("#app").innerHTML = `
     <section class="sidebar-panel" id="control-panel" role="tabpanel" aria-labelledby="control-tab"><div class="panel-heading"><div><div class="eyebrow">JOINT CONTROL</div><h2>关节控制</h2></div><span class="unit">rad</span></div>
     <p id="joint-intro" class="intro">调整目标角度，探索机械臂的运动。</p>
     <section id="robot-motion" hidden>
+      <div class="robot-mode-options" role="group" aria-label="真机控制模式">
+        <button type="button" data-mode="position" aria-pressed="true">位置控制</button>
+        <button type="button" data-mode="gravity" aria-pressed="false">重力补偿</button>
+        <button type="button" data-mode="gravity_friction" aria-pressed="false">重力＋摩擦</button>
+        <button type="button" data-mode="impedance" aria-pressed="false">阻抗控制</button>
+      </div>
       <label for="robot-speed">全局速度 <span>rad/s</span></label>
       <div class="joint-input">
         <input id="robot-speed-slider" type="range" aria-label="全局速度滑条（rad/s）" min="0.01" step="0.01">
@@ -39,9 +45,9 @@ document.querySelector("#app").innerHTML = `
     </section>
     <div class="column-key"><span>关节 / 目标角度</span><span>实际角度</span></div>
     <div id="joints"></div>
-    <section id="gripper-controls" class="joint" aria-label="夹爪控制"><div class="joint-heading"><label for="gripper-angle"><b>夹爪</b><span>电机目标 · rad</span></label><output id="gripper-opening" aria-label="夹爪实际开口">82.00 mm</output></div>
-    <div class="joint-input"><input id="gripper-slider" type="range" aria-label="夹爪电机角度滑条（rad）" min="0" max="2" step="0.01" value="2"><div class="number-wrap"><input id="gripper-angle" type="number" aria-label="夹爪电机目标（rad）" min="0" max="2" step="0.01" value="2"></div></div>
-    <div class="limits"><span>闭合 · 0 rad</span><span>张开 · 2 rad</span></div><p class="gripper-summary" id="gripper-target-opening">目标总开口 82.00 mm</p>
+    <section id="gripper-controls" class="joint" aria-label="夹爪控制"><div class="joint-heading"><label for="gripper-angle"><b>夹爪</b><span>电机目标 · rad</span></label><output id="gripper-opening" aria-label="夹爪实际开口">0.00 mm</output></div>
+    <div class="joint-input"><input id="gripper-slider" type="range" aria-label="夹爪电机角度滑条（rad）" min="0" max="2" step="0.01" value="0"><div class="number-wrap"><input id="gripper-angle" type="number" aria-label="夹爪电机目标（rad）" min="0" max="2" step="0.01" value="0"></div></div>
+    <div class="limits"><span>闭合 · 0 rad</span><span>张开 · 2 rad</span></div><p class="gripper-summary" id="gripper-target-opening">目标总开口 0.00 mm</p>
     <div class="gripper-buttons"><button id="gripper-close" disabled>闭合</button><button id="gripper-open" disabled>张开</button></div></section>
     <div id="simulation-actions" class="actions"><button id="reset" disabled>↺　全部复位</button><button id="pause" disabled aria-pressed="false">暂停</button></div>
     <div id="simulation-info" class="info"><span class="info-icon">◎</span><div><strong>在虚拟空间，自由探索。</strong><p>自碰撞物理阻挡 · 关节限位保护<br>仅控制虚拟机械臂</p></div></div>
@@ -70,6 +76,15 @@ let robotGripperTarget;
 let gripperEdited = false;
 let gripperHasCommand = false;
 let sendingPosition = false;
+let requestedMode;
+let positionCommandId;
+
+const modeDescriptions = {
+  position: "调整目标角度和速度，然后发送位置。",
+  gravity: "重力补偿已开启，可手动引导机械臂。",
+  gravity_friction: "重力与摩擦补偿已开启，可手动引导机械臂。",
+  impedance: "机械臂会柔顺地保持切换时的姿态。",
+};
 
 function showRobotStatus({ state, message }) {
   const stateChanged = robotConnection.dataset.state !== state;
@@ -82,6 +97,7 @@ function showRobotStatus({ state, message }) {
     : "连接真机";
   if (robotButton.textContent !== buttonText) robotButton.textContent = buttonText;
   if (state === "error") telemetry?.markDisconnected();
+  if (state === "error" || state === "disconnected") requestedMode = undefined;
   if (stateChanged) updateMotionControls();
 }
 
@@ -146,6 +162,7 @@ const labels = [
 ];
 
 const motionPanel = document.querySelector("#robot-motion");
+const robotModeButtons = [...motionPanel.querySelectorAll("[data-mode]")];
 const speedInput = document.querySelector("#robot-speed");
 const speedSlider = document.querySelector("#robot-speed-slider");
 const sendPosition = document.querySelector("#send-robot-position");
@@ -162,24 +179,35 @@ const gripperActual = document.querySelector("#gripper-opening");
 
 function receiveRobotPose(status) {
   const newSession = robotPose?.session !== status.session;
+  const mode = status.mode ?? "position";
+  const modeChanged = (robotPose?.mode ?? "position") !== mode;
+  const pendingChanged = robotPose?.pendingMode !== status.pendingMode;
+  const modeRejected = status.modeMessage && status.modeMessage !== robotPose?.modeMessage;
   robotPose = status;
-  if (newSession) {
-    robotTargets = status.positions.slice();
+  if (newSession || mode === requestedMode || modeRejected) requestedMode = undefined;
+  if (newSession || modeChanged) {
+    positionCommandId = undefined;
+    const holdTargets = status.motors.slice(0, labels.length).map((motor) => motor.target);
+    robotHasCommand = mode === "position" && holdTargets.every(Number.isFinite);
+    robotTargets = robotHasCommand ? holdTargets : status.positions.slice();
     editedRobotJoints.clear();
-    robotHasCommand = false;
     gripperEdited = false;
-    gripperHasCommand = false;
-    robotGripperTarget = status.gripper;
+    const gripperTarget = status.motors[labels.length]?.target;
+    gripperHasCommand = mode === "position" && Number.isFinite(gripperTarget);
+    robotGripperTarget = gripperHasCommand ? gripperTarget : status.gripper;
     sendingPosition = false;
     showMotionMessage("");
-    speedInput.max = speedSlider.max = status.maxSpeed;
-    speedInput.value = speedSlider.value = Math.min(0.2, status.maxSpeed);
-    updateSpeedTrack();
+    if (newSession) {
+      speedInput.max = speedSlider.max = status.maxSpeed;
+      speedInput.value = speedSlider.value = Math.min(0.2, status.maxSpeed);
+      updateSpeedTrack();
+      if (status.gripperLimits) setGripperLimits(...status.gripperLimits);
+    }
     controls.forEach((control, index) => {
-      control.setLimits(...status.limits[index]);
+      if (newSession) control.setLimits(...status.limits[index]);
       control.display(robotTargets[index]);
     });
-    if (status.gripperLimits) setGripperLimits(...status.gripperLimits);
+    if (status.gripperLimits) displayGripperTarget(robotGripperTarget);
     updateMotionControls();
   } else if (!robotHasCommand && !sendingPosition) {
     controls.forEach((control, index) => {
@@ -194,7 +222,13 @@ function receiveRobotPose(status) {
   }
   if (ready) {
     simulation.setRobotPose(status.positions, status.gripper);
+    if ((pendingChanged || modeRejected) && !newSession && !modeChanged) updateMotionControls();
     updateTargetPreview();
+    if (modeRejected) showMotionMessage(status.modeMessage);
+    const positionStatus = status.positionStatus;
+    if (positionStatus && positionStatus.commandId === positionCommandId) {
+      showMotionMessage(positionStatus.message);
+    }
     telemetry.update({
       source: "robot",
       session: status.session,
@@ -211,6 +245,7 @@ function receiveRobotPose(status) {
 function updateTargetPreview() {
   const show = Boolean(
     robotPose && robotConnection.dataset.state === "connected"
+    && (robotPose.mode ?? "position") === "position" && !requestedMode && !robotPose.pendingMode
     && (editedRobotJoints.size || gripperEdited),
   );
   previewKey.hidden = !show;
@@ -230,26 +265,38 @@ function updateMotionControls() {
   const state = robotConnection.dataset.state;
   const live = state === "connected" && Boolean(robotPose);
   const realView = Boolean(robotPose);
+  const mode = robotPose?.mode ?? "position";
+  const switchingTo = requestedMode || robotPose?.pendingMode;
+  const switching = Boolean(switchingTo);
+  const positionReady = live && !switching && mode === "position" && !sendingPosition;
   document.querySelector(".mode").lastChild.textContent = realView ? " 真机视图" : " 本地仿真";
   document.querySelector("#joint-intro").textContent = realView
-    ? (state === "homing" ? "正在回零，到位后自动断开。" : "调整目标角度和速度，然后发送位置。")
+    ? (state === "homing" ? "正在回零，到位后自动断开。"
+      : state === "error" ? "真机连接中断。"
+      : switchingTo === "impedance" ? "等待关节稳定后切入阻抗…"
+      : switching ? "正在切换控制模式…"
+      : modeDescriptions[mode])
     : "调整目标角度，探索机械臂的运动。";
   const returningToSimulation = !realView && !motionPanel.hidden;
   motionPanel.hidden = !realView;
+  for (const button of robotModeButtons) {
+    button.disabled = !live || switching || sendingPosition;
+    button.setAttribute("aria-pressed", String(button.dataset.mode === mode));
+  }
   gripperSection.hidden = realView && !robotPose.gripperLimits;
   gripperSlider.disabled = gripperInput.disabled = gripperClose.disabled = gripperOpen.disabled =
-    realView && (!live || sendingPosition);
+    realView && !positionReady;
   document.querySelector("#simulation-actions").hidden = realView;
   document.querySelector("#simulation-info").hidden = realView;
   returnToSimulation.hidden = !realView || state !== "error";
-  sendPosition.disabled = !live || !(editedRobotJoints.size || gripperEdited) || sendingPosition;
-  resetRobot.disabled = !live || sendingPosition ||
+  sendPosition.disabled = !positionReady || !(editedRobotJoints.size || gripperEdited);
+  resetRobot.disabled = !positionReady ||
     robotPose.limits.some(([lower, upper]) => lower > 0 || upper < 0) ||
     Boolean(robotPose.gripperLimits &&
       (robotPose.gripperLimits[0] > 0 || robotPose.gripperLimits[1] < 0));
-  speedInput.disabled = speedSlider.disabled = !live || sendingPosition;
+  speedInput.disabled = speedSlider.disabled = !positionReady;
   controls.forEach((control, index) => {
-    control.setDisabled(realView && (!live || sendingPosition));
+    control.setDisabled(realView && !positionReady);
     if (returningToSimulation) {
       const { min, max } = simulation.joints[index];
       control.setLimits(min, max);
@@ -264,8 +311,35 @@ function updateMotionControls() {
   updateTargetPreview();
 }
 
+for (const button of robotModeButtons) {
+  button.onclick = async () => {
+    const { mode } = button.dataset;
+    if (button.disabled || mode === (robotPose.mode ?? "position")) return;
+    const { session } = robotPose;
+    requestedMode = mode;
+    positionCommandId = undefined;
+    showMotionMessage("");
+    updateMotionControls();
+    try {
+      const response = await fetch("/api/panthera/mode", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ session, mode }),
+        signal: AbortSignal.timeout(5000),
+      });
+      const result = await response.json();
+      if (!response.ok) throw new Error(result.message);
+    } catch (error) {
+      if (robotPose?.session !== session || requestedMode !== mode) return;
+      requestedMode = undefined;
+      showMotionMessage(error.message || "切换控制模式失败");
+      updateMotionControls();
+    }
+  };
+}
+
 function showMotionMessage(message) {
-  motionStatus.textContent = message;
+  if (motionStatus.textContent !== message) motionStatus.textContent = message;
   motionStatus.hidden = !message;
 }
 
@@ -294,6 +368,7 @@ returnToSimulation.onclick = () => {
 };
 resetRobot.onclick = () => {
   if (resetRobot.disabled) return;
+  positionCommandId = undefined;
   controls.forEach((control, index) => {
     robotTargets[index] = 0;
     editedRobotJoints.add(index);
@@ -313,6 +388,7 @@ sendPosition.onclick = async () => {
   const positions = editedRobotJoints.size ? robotTargets.slice() : undefined;
   const gripper = gripperEdited ? robotGripperTarget : undefined;
   sendingPosition = true;
+  positionCommandId = undefined;
   showMotionMessage("");
   updateMotionControls();
   try {
@@ -327,6 +403,7 @@ sendPosition.onclick = async () => {
     if (robotPose?.session !== session) return;
     if (positions) robotHasCommand = true;
     if (gripper !== undefined) gripperHasCommand = true;
+    positionCommandId = result.commandId;
     editedRobotJoints.clear();
     gripperEdited = false;
     showMotionMessage(result.message);
@@ -388,6 +465,7 @@ function buildControls() {
         if (radians !== robotTargets[i]) {
           robotTargets[i] = radians;
           editedRobotJoints.add(i);
+          positionCommandId = undefined;
           showMotionMessage("");
           updateMotionControls();
         }
@@ -462,6 +540,7 @@ function applyGripperTarget(value, preserveInput = false) {
     if (target !== robotGripperTarget) {
       robotGripperTarget = target;
       gripperEdited = true;
+      positionCommandId = undefined;
       showMotionMessage("");
       updateMotionControls();
     }
@@ -571,7 +650,7 @@ try {
   );
   overlayButtons.forEach((button) => (button.disabled = false));
   buildControls();
-  updateGripper(2);
+  displayGripperTarget(simulation.gripperTarget);
   document.querySelector("#gripper-close").disabled = false;
   document.querySelector("#gripper-open").disabled = false;
   telemetry = new MotorTelemetry(

@@ -137,6 +137,25 @@ header {
 #robot-motion {
   margin-bottom: 20px;
 }
+.robot-mode-options {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 6px;
+  margin-bottom: 14px;
+}
+.robot-mode-options button {
+  padding: 7px 4px;
+  border: 1px solid #e5e5ea;
+  border-radius: 8px;
+  background: #f8f8fa;
+  color: #55555c;
+  font-size: 12px;
+}
+.robot-mode-options button[aria-pressed="true"] {
+  border-color: #b9d6f7;
+  background: #eaf3ff;
+  color: #1555a0;
+}
 #robot-motion > label {
   display: block;
   margin-bottom: 8px;

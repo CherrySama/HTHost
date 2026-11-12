@@ -127,14 +127,15 @@ export class Simulation {
       (joint) => this.model.jnt_bodyid[joint.id],
     );
     this.paused = false;
-    this.reset();
+    this.reset(0);
   }
 
-  reset() {
+  reset(gripperTarget = 2) {
     this.accumulator = 0;
     this.mj.mj_resetData(this.model, this.data);
     this.targets.fill(0);
-    this.gripperTarget = 2;
+    this.gripperTarget = gripperTarget;
+    this.writeGripperPose(this.data, gripperTarget);
     this.mj.mj_forward(this.model, this.data);
   }
 
@@ -169,10 +170,14 @@ export class Simulation {
       data.qpos[joint.q] = positions[index];
     });
     if (Number.isFinite(gripper)) {
-      const displacement = (gripperOpening(gripper) / 1000 - 0.082) / 2;
-      data.qpos[this.gripperJoints[0].q] = displacement;
-      data.qpos[this.gripperJoints[1].q] = -displacement;
+      this.writeGripperPose(data, gripper);
     }
+  }
+
+  writeGripperPose(data, gripper) {
+    const displacement = (gripperOpening(gripper) / 1000 - 0.082) / 2;
+    data.qpos[this.gripperJoints[0].q] = displacement;
+    data.qpos[this.gripperJoints[1].q] = -displacement;
   }
 
   getGripperState() {

@@ -15,6 +15,7 @@ from threading import Lock
 SDK = Path(__file__).resolve().parents[1] / "Panthera-HT_SDK" / "panthera_python"
 ENDPOINT = "/api/panthera/connection"
 POSITION_ENDPOINT = "/api/panthera/position"
+MODE_ENDPOINT = "/api/panthera/mode"
 STARTUP_TIMEOUT = 15
 FEEDBACK_TIMEOUT = 2
 CONTROL_INTERVAL = 0.04
@@ -26,6 +27,23 @@ GRIPPER_MAX_TORQUE = 0.15
 RETURN_SPEED = 0.2
 RETURN_SETTLE_SAMPLES = 3
 RETURN_SETTLE_SPEED = 0.03
+POSITION, GRAVITY, GRAVITY_FRICTION, IMPEDANCE = range(4)
+CONTROL_MODES = ("position", "gravity", "gravity_friction", "impedance")
+TORQUE_INTERVAL = 0.005
+TORQUE_FEEDBACK_TIMEOUT = 0.15
+CONTROL_WATCHDOG_MS = 250
+MODE_TRANSITION_SECONDS = 0.25
+IMPEDANCE_TRANSITION_SECONDS = 0.5
+IMPEDANCE_SETTLE_SPEED = 0.06
+IMPEDANCE_SETTLE_SECONDS = 0.15
+IMPEDANCE_WAIT_SECONDS = 3
+MOTOR_POSITION_MODE = 10
+POSITION_RESPONSE_SECONDS = 0.6
+TORQUE_LIMITS = (10.0, 10.0, 10.0, 10.0, 10.0, 3.7)
+FRICTION_COULOMB = (0.10, 0.12, 0.12, 0.08, 0.03, 0.02)
+FRICTION_VISCOUS = (0.04, 0.06, 0.06, 0.04, 0.02, 0.02)
+IMPEDANCE_STIFFNESS = (4.0, 10.0, 10.0, 2.0, 2.0, 1.0)
+IMPEDANCE_DAMPING = (0.5, 0.8, 0.8, 0.2, 0.2, 0.1)
 
 
 class RobotSession:
@@ -33,10 +51,72 @@ class RobotSession:
         self.id = uuid.uuid4().hex
         self.stop = context.Event()
         self.returned = context.Event()
-        self.feedback = context.Array("d", 1 + 4 * MOTOR_SLOTS)
+        self.feedback = context.Array("d", 5 + 6 * MOTOR_SLOTS)
         self.limits = context.Array("d", 2 * ARM_JOINTS + 3)
-        self.command = context.Array("d", [0, 0, 0, math.nan, 0, *([0] * ARM_JOINTS)])
+        self.command = context.Array("d", [0, POSITION, 0, 0, math.nan, 0, *([0] * ARM_JOINTS)])
         self.last_status_request = context.Value("d", 0, lock=False)
+
+
+class TorqueControl:
+    def __init__(self, robot, mode, positions, now, previous=None):
+        self.robot = robot
+        self.mode = mode
+        self.started = now
+        self.target = positions[:ARM_JOINTS] if mode == IMPEDANCE else None
+        self.previous_torque = previous.torque if previous else None
+        self.torque = None
+        self.zero = [0.0] * ARM_JOINTS
+        self.limits = [min(limit, rated) for limit, rated in zip(TORQUE_LIMITS, robot.max_torque)]
+        self.gripper_position = positions[-1]
+        self.gripper_gain = 0.0
+        self.previous_gripper_gain = previous.gripper_gain if previous else 0.0
+        if previous and previous.mode == IMPEDANCE and mode != IMPEDANCE:
+            self.gripper_position = previous.gripper_position
+
+    def send(self, positions, velocities, now):
+        arm = positions[:ARM_JOINTS]
+        velocity = velocities[:ARM_JOINTS]
+        gravity = list(self.robot.get_Gravity(arm))
+        if len(gravity) != ARM_JOINTS or not all(math.isfinite(value) for value in gravity):
+            raise RuntimeError("动力学计算返回了无效重力力矩")
+        torque = gravity
+        if self.mode == GRAVITY_FRICTION:
+            friction = self.robot.get_friction_compensation(
+                velocity, FRICTION_COULOMB, FRICTION_VISCOUS, 0.02
+            )
+            torque = [g + f for g, f in zip(gravity, friction)]
+        elif self.mode == IMPEDANCE:
+            torque = [
+                g + k * (target - position) - b * speed
+                for g, k, b, target, position, speed in zip(
+                    gravity, IMPEDANCE_STIFFNESS, IMPEDANCE_DAMPING, self.target, arm, velocity
+                )
+            ]
+
+        if len(torque) != ARM_JOINTS or not all(math.isfinite(value) for value in torque):
+            raise RuntimeError("动力学计算返回了无效力矩")
+        duration = IMPEDANCE_TRANSITION_SECONDS if self.mode == IMPEDANCE else MODE_TRANSITION_SECONDS
+        progress = min(1.0, (now - self.started) / duration)
+        blend = progress * progress * (3 - 2 * progress)
+        previous = self.previous_torque if self.previous_torque is not None else gravity
+        self.torque = [
+            max(-limit, min(limit, start + blend * (value - start)))
+            for start, value, limit in zip(previous, torque, self.limits)
+        ]
+
+        if self.robot.has_gripper:
+            gain = self.previous_gripper_gain + blend * (
+                float(self.mode == IMPEDANCE) - self.previous_gripper_gain
+            )
+            self.gripper_gain = gain
+            gripper_position = self.gripper_position if gain else 0.0
+            if not self.robot.gripper_control_MIT(
+                gripper_position, 0.0, 0.0, 0.65 * gain, 0.06 * gain, send=False
+            ):
+                raise RuntimeError("SDK 拒绝了夹爪力矩指令")
+        if not self.robot.pos_vel_tqe_kp_kd(self.zero, self.zero, self.torque, self.zero, self.zero):
+            raise RuntimeError("SDK 拒绝了关节力矩指令")
+        return progress >= 1.0
 
 
 def monitor_robot(session, errors):
@@ -74,20 +154,32 @@ def monitor_robot(session, errors):
         }
         readings = {}
         applied_targets = [math.nan] * MOTOR_SLOTS
+        applied_command_id = 0
+        applied_at = 0
         command_id = 0
+        rejected_mode_id = 0
+        waiting_impedance_id = 0
+        impedance_wait_started = 0
+        settled_since = None
         target = None
         speeds = None
         gripper_target = math.nan
         gripper_speed = 0
         return_deadline = 0
         settled_samples = 0
+        torque_control = None
+        confirmed_mode = POSITION
+        watchdog_ready = False
+        handoff_until = 0
+        handoff_positions = None
+        handoff_gripper = math.nan
         position_tolerance = float(robot.config.get("control", {}).get("position_tolerance", 0.01))
         last_complete = time.monotonic()
         parent = multiprocessing.parent_process()
         while not stop.is_set() and parent.is_alive():
             robot.send_get_motor_state_cmd()
             robot.motor_send_cmd()
-            if stop.wait(CONTROL_INTERVAL):
+            if stop.wait(TORQUE_INTERVAL if torque_control else CONTROL_INTERVAL):
                 break
 
             for motor_id, motor in list(pending.items()):
@@ -101,7 +193,7 @@ def monitor_robot(session, errors):
                     and all(math.isfinite(value) and abs(value) < 998 for value in values)
                 ):
                     timestamps[motor_id] = timestamp
-                    readings[motor_id] = values
+                    readings[motor_id] = (*values, state.mode, state.fault)
                     del pending[motor_id]
 
             now = time.monotonic()
@@ -111,22 +203,94 @@ def monitor_robot(session, errors):
                 last_complete = now
                 measured = [readings[motor_id] for motor_id in motor_ids]
                 if not robot.gripper_installed:
-                    measured.append((math.nan, math.nan, math.nan))
-                positions, velocities, torques = zip(*measured)
-                session.feedback[:] = [now, *positions, *velocities, *torques, *applied_targets]
+                    measured.append((math.nan, math.nan, math.nan, 0, 0))
+                positions, velocities, torques, motor_modes, motor_faults = zip(*measured)
+                session.feedback[:] = [
+                    now, confirmed_mode, rejected_mode_id, applied_command_id, applied_at,
+                    *positions, *velocities, *torques, *applied_targets, *motor_modes, *motor_faults,
+                ]
                 pending = {motor.get_motor_id(): motor for motor in motors}
-                next_id, speed, gripper_speed, gripper_target, deadline, *next_target = session.command[:]
-                if next_id != command_id:
+                next_id, mode, speed, next_gripper_speed, next_gripper, deadline, *next_target = session.command[:]
+                accept_command = next_id != command_id
+                if accept_command and mode == IMPEDANCE:
+                    if waiting_impedance_id != next_id:
+                        waiting_impedance_id = next_id
+                        impedance_wait_started = now
+                        settled_since = None
+                    if all(abs(velocity) <= IMPEDANCE_SETTLE_SPEED for velocity in velocities[:len(motors)]):
+                        if settled_since is None:
+                            settled_since = now
+                    else:
+                        settled_since = None
+                    accept_command = settled_since is not None and now - settled_since >= IMPEDANCE_SETTLE_SECONDS
+                    if not accept_command and now - impedance_wait_started >= IMPEDANCE_WAIT_SECONDS:
+                        rejected_mode_id = command_id = next_id
+
+                if accept_command:
                     command_id = next_id
-                    target = next_target if speed else None
-                    speeds = [speed] * ARM_JOINTS
                     return_deadline = deadline
                     settled_samples = 0
-                has_gripper_target = math.isfinite(gripper_target)
-                if (target is not None or has_gripper_target) and not stop.is_set():
+                    if mode != POSITION:
+                        torque_control = TorqueControl(robot, mode, positions, now, torque_control)
+                        target = None
+                        gripper_target = math.nan
+                    elif torque_control:
+                        handoff_positions = positions[:ARM_JOINTS]
+                        if any(
+                            not lower <= position <= upper
+                            for position, lower, upper in zip(
+                                handoff_positions, robot.joint_limits["lower"], robot.joint_limits["upper"]
+                            )
+                        ):
+                            raise RuntimeError("实测姿态超出关节限位，无法切回位置控制")
+                        handoff_gripper = math.nan
+                        if robot.has_gripper and robot.gripper_limits:
+                            if robot.gripper_limits["lower"] <= positions[-1] <= robot.gripper_limits["upper"]:
+                                handoff_gripper = positions[-1]
+                        hold_speed = min(RETURN_SPEED, min(robot.velocity_limits))
+                        target = next_target if deadline else handoff_positions
+                        speeds = [speed if deadline else hold_speed] * ARM_JOINTS
+                        gripper_target = next_gripper if deadline else handoff_gripper
+                        gripper_speed = next_gripper_speed if deadline else min(hold_speed, GRIPPER_MAX_SPEED)
+                        handoff_until = now + MODE_TRANSITION_SECONDS if deadline else 0
+                        torque_control = None
+                    else:
+                        if speed:
+                            target = next_target
+                            speeds = [speed] * ARM_JOINTS
+                        if next_gripper_speed:
+                            gripper_target = next_gripper
+                            gripper_speed = next_gripper_speed
+
+                handoff = now < handoff_until
+                arm_command = handoff_positions if handoff else target
+                gripper_command = handoff_gripper if handoff else gripper_target
+                has_gripper_target = math.isfinite(gripper_command)
+                if (torque_control or arm_command is not None or has_gripper_target) and not stop.is_set():
+                    fault_message = describe_motor_faults(motor_faults)
+                    if fault_message:
+                        raise RuntimeError(fault_message)
+                    if not watchdog_ready:
+                        timeout = robot.motor_timeout_ms
+                        robot.set_timeout(min(timeout, CONTROL_WATCHDOG_MS) if timeout > 0 else CONTROL_WATCHDOG_MS)
+                        watchdog_ready = True
+
+                if torque_control and not stop.is_set():
+                    if now - session.last_status_request.value > CONTROL_LEASE:
+                        raise RuntimeError("控制页面已失联，力矩控制已结束")
+                    if torque_control.send(positions, velocities, now):
+                        confirmed_mode = torque_control.mode
+                    applied_targets[:ARM_JOINTS] = torque_control.target or [math.nan] * ARM_JOINTS
+                    applied_targets[-1] = (
+                        torque_control.gripper_position
+                        if torque_control.mode == IMPEDANCE and robot.has_gripper else math.nan
+                    )
+                    continue
+
+                if (arm_command is not None or has_gripper_target) and not stop.is_set():
                     if now - session.last_status_request.value > CONTROL_LEASE:
                         raise RuntimeError("控制页面已失联，位置控制已结束")
-                    if return_deadline:
+                    if return_deadline and not handoff:
                         count = MOTOR_SLOTS if has_gripper_target else ARM_JOINTS
                         at_zero = all(
                             abs(position) <= position_tolerance and abs(velocity) <= RETURN_SETTLE_SPEED
@@ -136,17 +300,21 @@ def monitor_robot(session, errors):
                         if settled_samples >= RETURN_SETTLE_SAMPLES:
                             session.returned.set()
                             break
-                    if target is not None:
-                        if not robot.Joint_Pos_Vel(target, speeds, iswait=False):
+                    if arm_command is not None:
+                        if not robot.Joint_Pos_Vel(arm_command, speeds, iswait=False):
                             raise RuntimeError("SDK 拒绝了关节目标")
-                        applied_targets[:ARM_JOINTS] = target
+                        applied_targets[:ARM_JOINTS] = arm_command
                     if has_gripper_target and not stop.is_set():
-                        if not robot.gripper_control(gripper_target, gripper_speed, GRIPPER_MAX_TORQUE):
+                        if not robot.gripper_control(gripper_command, gripper_speed, GRIPPER_MAX_TORQUE):
                             raise RuntimeError("SDK 拒绝了夹爪目标")
-                        applied_targets[-1] = gripper_target
+                    applied_targets[-1] = gripper_command
+                    confirmed_mode = POSITION
+                    if applied_command_id != command_id and command_id != rejected_mode_id:
+                        applied_command_id = command_id
+                        applied_at = now
                 elif stop.wait(0.06):
                     break
-            elif now - last_complete > FEEDBACK_TIMEOUT:
+            elif now - last_complete > (TORQUE_FEEDBACK_TIMEOUT if torque_control else FEEDBACK_TIMEOUT):
                 missing = "、".join(motor.get_motor_name() for motor in pending.values())
                 raise RuntimeError(f"未收到电机反馈（{missing}）")
     except KeyboardInterrupt:
@@ -206,6 +374,8 @@ class RobotConnection:
             status = self._status()
             if status["state"] != "connected" or request.get("session") != status["session"]:
                 return 409, {"message": "真机连接已失效，请重新连接"}
+            if status["mode"] != "position" or status["pendingMode"]:
+                return 409, {"message": "请切回位置控制后再发送目标"}
 
             has_arm = "positions" in request
             has_gripper = "gripper" in request
@@ -216,7 +386,7 @@ class RobotConnection:
                 return 400, {"message": "速度超出真机允许范围"}
 
             command = self.session.command
-            command_id, arm_speed, gripper_speed, gripper, _, *positions = command[:]
+            command_id, _, arm_speed, gripper_speed, gripper, _, *positions = command[:]
             if has_arm:
                 positions = request["positions"]
                 if (
@@ -242,8 +412,35 @@ class RobotConnection:
                 gripper_speed = min(speed, GRIPPER_MAX_SPEED)
 
             self.session.last_status_request.value = time.monotonic()
-            command[:] = [command_id + 1, arm_speed, gripper_speed, gripper, 0, *positions]
-            return 202, {"message": "位置已发送"}
+            command_id += 1
+            command[:] = [command_id, POSITION, arm_speed, gripper_speed, gripper, 0, *positions]
+            return 202, {"message": "位置目标已提交，等待电机反馈", "commandId": int(command_id)}
+
+    def set_mode(self, request):
+        with self.lock:
+            status = self._status()
+            if status["state"] != "connected" or request.get("session") != status["session"]:
+                return 409, {"message": "真机当前无法切换控制模式"}
+            mode = request.get("mode")
+            if mode not in CONTROL_MODES:
+                return 400, {"message": "未知的控制模式"}
+            if status["pendingMode"]:
+                return 409, {"message": "正在切换控制模式"}
+            if mode == status["mode"]:
+                return 200, {"mode": mode}
+            if any(
+                not lower <= position <= upper
+                for position, (lower, upper) in zip(status["positions"], status["limits"])
+            ):
+                return 409, {"message": "实测姿态超出关节限位，无法切换控制模式"}
+
+            command = self.session.command
+            self.session.last_status_request.value = time.monotonic()
+            command[:] = [
+                command[0] + 1, CONTROL_MODES.index(mode), 0, 0, math.nan, 0,
+                *([0] * ARM_JOINTS),
+            ]
+            return 202, {"mode": mode}
 
     def return_and_disconnect(self, request):
         with self.lock:
@@ -273,7 +470,7 @@ class RobotConnection:
             command = self.session.command
             self.session.last_status_request.value = now
             command[:] = [
-                command[0] + 1, speed, gripper_speed, gripper_target,
+                command[0] + 1, POSITION, speed, gripper_speed, gripper_target,
                 self.return_deadline, *([0] * ARM_JOINTS),
             ]
             status["state"] = "homing"
@@ -293,7 +490,7 @@ class RobotConnection:
                 self.message = "Panthera SDK 进程已退出"
 
             now = time.monotonic()
-            last_feedback, *feedback = self.session.feedback[:]
+            last_feedback, confirmed_mode, rejected_id, applied_id, applied_at, *feedback = self.session.feedback[:]
             if not self.message:
                 if self.return_deadline and now >= self.return_deadline:
                     self.message = "等待到位超时"
@@ -304,9 +501,13 @@ class RobotConnection:
                 elif not last_feedback:
                     return {"state": "connecting"}
                 else:
+                    mode = CONTROL_MODES[int(confirmed_mode)]
+                    request_id, requested_code = self.session.command[:2]
+                    requested_mode = CONTROL_MODES[int(requested_code)]
+                    rejected = request_id != 0 and request_id == rejected_id
                     limits = self.session.limits[:2 * ARM_JOINTS]
                     max_speed, gripper_min, gripper_max = self.session.limits[2 * ARM_JOINTS:]
-                    positions, velocities, torques, targets = (
+                    positions, velocities, torques, targets, motor_modes, motor_faults = (
                         feedback[start:start + MOTOR_SLOTS]
                         for start in range(0, len(feedback), MOTOR_SLOTS)
                     )
@@ -316,13 +517,23 @@ class RobotConnection:
                             "velocity": velocity,
                             "torque": torque,
                             "target": target if math.isfinite(target) else None,
+                            "driveMode": int(drive_mode),
+                            "fault": int(fault),
                         }
-                        for position, velocity, torque, target in zip(positions, velocities, torques, targets)
+                        for position, velocity, torque, target, drive_mode, fault in zip(
+                            positions, velocities, torques, targets, motor_modes, motor_faults
+                        )
                         if math.isfinite(position)
                     ]
                     return {
                         "state": "homing" if self.return_deadline else "connected",
                         "session": self.session.id,
+                        "mode": mode,
+                        "pendingMode": requested_mode if requested_mode != mode and not rejected else None,
+                        "modeMessage": "关节速度未稳定，已保留原控制模式" if rejected else None,
+                        "positionStatus": describe_position_status(motors, applied_id, last_feedback - applied_at)
+                        if applied_id and applied_id == request_id and requested_code == POSITION
+                        and mode == "position" and not self.return_deadline else None,
                         "positions": positions[:ARM_JOINTS],
                         "gripper": motors[-1]["position"] if len(motors) == MOTOR_SLOTS else None,
                         "sampleTime": last_feedback - self.started,
@@ -360,6 +571,38 @@ def is_finite_number(value):
     return type(value) in (int, float) and -math.inf < value < math.inf
 
 
+def motor_name(index):
+    return f"J{index + 1}" if index < ARM_JOINTS else "夹爪"
+
+
+def describe_motor_faults(faults):
+    faults = [f"{motor_name(i)}（故障码 {int(code)}）" for i, code in enumerate(faults) if code]
+    return f"电机报告故障：{'、'.join(faults)}" if faults else None
+
+
+def describe_position_status(motors, command_id, elapsed):
+    unfinished = [
+        (index, motor)
+        for index, motor in enumerate(motors)
+        if motor["target"] is not None
+        and (abs(motor["target"] - motor["position"]) > 0.01 or abs(motor["velocity"]) > 0.03)
+    ]
+    inactive = [
+        f"{motor_name(index)}（模式 {motor['driveMode']}）"
+        for index, motor in unfinished
+        if motor["driveMode"] != MOTOR_POSITION_MODE and abs(motor["velocity"]) <= 0.03
+    ]
+    if not unfinished:
+        message = "已到达位置目标"
+    elif inactive and elapsed >= POSITION_RESPONSE_SECONDS:
+        message = f"电机未进入位置控制：{'、'.join(inactive)}"
+    elif inactive:
+        message = "位置目标已提交，等待电机反馈"
+    else:
+        message = "电机已响应，尚未到位"
+    return {"commandId": int(command_id), "message": message}
+
+
 class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.respond(self.server.robot.status)
@@ -367,6 +610,8 @@ class Handler(BaseHTTPRequestHandler):
     def do_POST(self):
         if self.path == POSITION_ENDPOINT:
             self.respond_with_request(self.server.robot.set_position)
+        elif self.path == MODE_ENDPOINT:
+            self.respond_with_request(self.server.robot.set_mode)
         else:
             self.respond(self.server.robot.connect, mutation=True)
 
