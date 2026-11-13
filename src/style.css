@@ -895,6 +895,24 @@ input[type="range"]::-moz-range-thumb {
   color: #55555c;
   background: #f7f7f9;
 }
+.sdk-tabs {
+  display: flex;
+  gap: 4px;
+  padding: 3px;
+  margin-bottom: 18px;
+  border-radius: 9px;
+  background: #f0f0f4;
+}
+.sdk-tabs button {
+  flex: 1;
+  border: 0;
+  background: transparent;
+}
+.sdk-tabs button[aria-selected="true"] {
+  color: #1d1d1f;
+  background: white;
+  box-shadow: 0 1px 4px #00000012;
+}
 .sdk-row, .sdk-settings {
   display: flex;
   gap: 6px;
@@ -966,7 +984,10 @@ input[type="range"]::-moz-range-thumb {
 .sdk-actions, #sdk-scrub-label, #sdk-status {
   margin-top: 10px;
 }
-.sdk-actions #sdk-stop:enabled {
+#sdk-track-info {
+  overflow-wrap: anywhere;
+}
+.sdk-actions .sdk-stop:enabled {
   background: #fce8e6;
   color: #a42620;
 }

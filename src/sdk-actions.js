@@ -2,6 +2,7 @@ import { Quaternion, Vector3 } from "three";
 
 export const MAX_ACTION_SEGMENTS = 64;
 export const MAX_ACTION_FRAMES = 6000;
+export const MAX_RECORDING_FRAMES = MAX_ACTION_FRAMES - 1;
 const GRIPPER_SPEED = 0.3;
 
 function bounded(value, [lower, upper]) {
@@ -24,6 +25,46 @@ export function validatePose(pose, limits, gripperLimits) {
       || pose.gripper < gripperLimits[0] || pose.gripper > gripperLimits[1])) {
     throw new Error("夹爪目标超出限位或夹爪不可用");
   }
+}
+
+export function normalizeRecording(frames) {
+  if (frames.length < 2 || frames.length > MAX_RECORDING_FRAMES) {
+    throw new Error("轨迹须包含 2–" + MAX_RECORDING_FRAMES + " 帧");
+  }
+  const origin = frames[0]?.t;
+  const hasGripper = frames[0]?.gripper_pos !== undefined;
+  let previous = -Infinity;
+  return frames.map((frame, index) => {
+    const t = frame?.t - origin;
+    const positionValid = Array.isArray(frame?.pos) && frame.pos.length === 6
+      && frame.pos.every(Number.isFinite);
+    const velocityValid = frame?.vel === undefined || (Array.isArray(frame.vel)
+      && frame.vel.length === 6 && frame.vel.every(Number.isFinite));
+    if (!Number.isFinite(frame?.t) || !Number.isFinite(t) || t <= previous || t > 1800
+        || !positionValid || !velocityValid
+        || (frame.gripper_pos !== undefined) !== hasGripper
+        || (hasGripper && !Number.isFinite(frame.gripper_pos))
+        || (frame.gripper_vel !== undefined && (!hasGripper || !Number.isFinite(frame.gripper_vel)))) {
+      throw new Error("第 " + (index + 1) + " 帧时间或姿态无效");
+    }
+    previous = t;
+    const { pos, vel, gripper_pos, gripper_vel } = frame;
+    return { t, pos, vel, gripper_pos, gripper_vel };
+  });
+}
+
+function recordingPoints(frames, limits, gripperLimits) {
+  // Measured joints can sit slightly past a commanded limit, especially at zero.
+  const correctNoise = (value, range) => {
+    if (!range) return value;
+    const corrected = bounded(value, range);
+    return Math.abs(value - corrected) <= 0.015 ? corrected : value;
+  };
+  return frames.map(({ t, pos, gripper_pos }) => ({
+    t,
+    positions: pos.map((angle, i) => correctNoise(angle, limits[i])),
+    gripper: gripper_pos === undefined ? null : correctNoise(gripper_pos, gripperLimits),
+  }));
 }
 
 function cartesianFrames(item, start, limits, hasGripper, simulation) {
@@ -102,12 +143,13 @@ export function compileActions(items, start, settings, context) {
   let firstGoal;
   let transition;
   let frames = 0;
-  function append(label, points, dwell) {
+  function append(label, points, dwell, retime = true, native) {
     if (segments.length >= MAX_ACTION_SEGMENTS) throw new Error("最多 64 个动作步骤（含返回起点）");
     points.forEach((pose) => validatePose(pose, limits, gripperLimits));
     frames += points.length;
     if (frames > MAX_ACTION_FRAMES) throw new Error("动作采样帧数超出范围");
-    segments.push({ label, points: speedLimitedFrames(points, settings.speed), dwell });
+    segments.push({ label, points: retime ? speedLimitedFrames(points, settings.speed) : points, dwell,
+      ...(native ? { native } : {}) });
   }
   for (const item of items) {
     try {
@@ -121,6 +163,7 @@ export function compileActions(items, start, settings, context) {
       else if (item.kind === "zero") points = [{ positions: limits.map(() => 0), gripper: gripperLimits ? 0 : null, t: 0 }];
       else if (item.kind === "hold") points = [{ ...cursor, t: 0 }];
       else if (item.kind === "joint-sine") points = jointSineFrames(cursor, limits, settings.speed);
+      else if (item.kind === "recording") points = recordingPoints(item.frames, limits, gripperLimits);
       else points = cartesianFrames(item, cursor, limits, Boolean(gripperLimits), simulation);
       if (item.kind === "joint-sine") {
         append("回零准备", [{ positions: limits.map(() => 0), gripper: cursor.gripper, t: 0 }], 0);
@@ -136,7 +179,9 @@ export function compileActions(items, start, settings, context) {
       if (item.kind === "zero" && item.duration) {
         points = [{ ...cursor, t: 0 }, { ...points[0], t: item.duration }];
       }
-      append(item.label, points, item.kind === "hold" ? item.duration : settings.dwell);
+      append(item.label, points, item.kind === "hold" ? item.duration : settings.dwell,
+        item.kind !== "recording" || !context.real,
+        context.real && ["joint-sine", "recording"].includes(item.kind) ? item.kind : undefined);
       cursor = points.at(-1);
       if (item.kind === "joint-sine") {
         append("正弦结束回零", [{ positions: limits.map(() => 0), gripper: cursor.gripper, t: 0 }], 0);

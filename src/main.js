@@ -31,7 +31,7 @@ document.querySelector("#app").innerHTML = `
     <div id="loading" role="status"><span class="spinner"></span><span id="load-message">正在准备工作空间…</span></div>
     <div class="scene-footer"><span><i class="live-dot"></i><span id="status">正在加载</span></span><span>拖动旋转 · 滚轮缩放 · 右键平移</span></div>
   </section>
-  <aside><nav class="sidebar-tabs" role="tablist" aria-label="侧边面板"><button id="control-tab" role="tab" aria-selected="true" aria-controls="control-panel">关节控制</button><button id="monitor-tab" role="tab" aria-selected="false" aria-controls="motor-monitor" tabindex="-1" disabled>电机监控</button><button id="sdk-tab" role="tab" aria-selected="false" aria-controls="sdk-panel" tabindex="-1" disabled>SDK 示例</button></nav>
+  <aside><nav class="sidebar-tabs" role="tablist" aria-label="侧边面板"><button id="control-tab" role="tab" aria-selected="true" aria-controls="control-panel">关节控制</button><button id="monitor-tab" role="tab" aria-selected="false" aria-controls="motor-monitor" tabindex="-1" disabled>电机监控</button><button id="sdk-tab" role="tab" aria-selected="false" aria-controls="sdk-panel" tabindex="-1" disabled>SDK 脚本</button></nav>
     <section class="sidebar-panel" id="control-panel" role="tabpanel" aria-labelledby="control-tab">
     <div class="panel-heading">
       <div><div class="eyebrow">JOINT CONTROL</div><h2>关节控制</h2></div>
@@ -116,7 +116,8 @@ function showRobotStatus({ state, message }) {
   robotConnection.dataset.state = state;
   const text = message || robotStatusLabels[state];
   if (robotStatus.textContent !== text) robotStatus.textContent = text;
-  robotButton.disabled = Boolean(sdk?.locked()) || ["connecting", "disconnecting", "homing"].includes(state);
+  robotButton.disabled = Boolean(sdk?.locked() || sdk?.recordingNow())
+    || ["connecting", "disconnecting", "homing"].includes(state);
   const buttonText = ["connected", "disconnecting", "homing"].includes(state)
     ? "断开真机"
     : "连接真机";
@@ -125,6 +126,7 @@ function showRobotStatus({ state, message }) {
   if (state === "error" || state === "disconnected") {
     requestedMode = undefined;
     sdk?.updateHardware(null, true);
+    sdk?.updateRecording(null, null, true);
   }
   if (stateChanged) updateMotionControls();
 }
@@ -169,6 +171,7 @@ async function refreshRobotStatus(method = "GET", initial = false) {
 }
 
 robotButton.onclick = () => {
+  if (robotButton.disabled) return;
   sdk?.clearPreview();
   clearTimeout(robotStatusTimer);
   const connected = robotConnection.dataset.state === "connected";
@@ -292,8 +295,12 @@ function receiveRobotPose(status) {
   );
   const modeRejected = status.modeMessage && status.modeMessage !== robotPose?.modeMessage;
   robotPose = status;
-  if (newSession) sdk?.updateHardware(null, true);
+  if (newSession) {
+    sdk?.updateHardware(null, true);
+    sdk?.updateRecording(null, null, true);
+  }
   sdk?.updateHardware(status.action);
+  sdk?.updateRecording(status.recording, status.session);
   if (newSession || modeChanged || positionCompleted || status.positionPhase === "settling") {
     pausingPosition = false;
   }
@@ -383,6 +390,7 @@ function updateMotionControls() {
   const live = state === "connected" && Boolean(robotPose);
   const realView = Boolean(robotPose);
   const sdkLocked = sdk?.locked();
+  const sdkRecording = sdk?.recordingNow();
   viewer.setRobotView(realView);
   const mode = robotPose?.mode ?? "position";
   const positionActionsAvailable = robotPose?.positionPhase !== undefined;
@@ -414,7 +422,7 @@ function updateMotionControls() {
   const returningToSimulation = !realView && !motionPanel.hidden;
   motionPanel.hidden = !realView;
   for (const button of robotModeButtons) {
-    button.disabled = !live || switching || sendingPosition || positionBusy || Boolean(sdkLocked);
+    button.disabled = !live || switching || sendingPosition || positionBusy || Boolean(sdkLocked || sdkRecording);
     button.setAttribute("aria-pressed", String(button.dataset.mode === mode));
   }
   gripperSection.hidden = realView && !robotPose.gripperLimits;
@@ -444,8 +452,9 @@ function updateMotionControls() {
     displayGripperTarget(simulation.gripperTarget);
     telemetry.update(simulation.getMotorTelemetry(), simulation.paused);
   }
-  robotButton.disabled = Boolean(sdkLocked) || ["connecting", "disconnecting", "homing"].includes(state);
-  document.querySelector("#reset").disabled = Boolean(sdkLocked);
+  robotButton.disabled = Boolean(sdkLocked || sdkRecording)
+    || ["connecting", "disconnecting", "homing"].includes(state);
+  document.querySelector("#reset").disabled = Boolean(sdkLocked || sdkRecording);
   sdk?.refresh();
   updateTargetPreview();
 }
@@ -455,10 +464,14 @@ function sdkContext() {
   const state = robotConnection.dataset.state;
   if (robotPose) {
     if (state !== "connected") return null;
+    const recordingSupported = robotPose.recording !== undefined;
     return {
       real: true, simulation, session: robotPose.session,
       pose: { positions: robotPose.positions, gripper: robotPose.gripper },
       limits: robotPose.limits, gripperLimits: robotPose.gripperLimits, maxSpeed: robotPose.maxSpeed,
+      canRecord: recordingSupported && ["gravity", "gravity_friction"].includes(robotPose.mode)
+        && !requestedMode && !robotPose.pendingMode && !robotPose.positionPhase,
+      recordingHint: recordingSupported ? "" : "请重启真机桥接服务以启用录制",
       canRun: robotPose.action !== undefined && robotPose.mode === "position" && !robotPose.pendingMode
         && !requestedMode && !sendingPosition && !robotPose.positionPhase
         && !(positionCommandId > (robotPose.positionStatus?.commandId ?? 0)),
@@ -467,7 +480,8 @@ function sdkContext() {
   if (state === "connecting") return null;
   return {
     real: false, simulation, pose: simulation.getActionPose(), maxSpeed: 1,
-    limits: simulation.joints.map(({ min, max }) => [min, max]), gripperLimits: [0, 2], canRun: true,
+    limits: simulation.joints.map(({ min, max }) => [min, max]), gripperLimits: [0, 2],
+    canRun: true, canRecord: true,
   };
 }
 
@@ -897,7 +911,10 @@ try {
     changed: updateMotionControls,
     preview: previewSdkAction,
     run: (payload) => postSdkAction("", payload),
+    estimate: (payload) => postSdkAction("/estimate", payload),
     stop: (id) => postSdkAction("/stop", { id, session: robotPose?.session }),
+    startRecording: (session) => postSdkAction("/record/start", { session }),
+    stopRecording: (session, id) => postSdkAction("/record/stop", { session, id }),
     syncSimulation: () => {
       controls.forEach((control, i) => control.display(simulation.targets[i]));
       displayGripperTarget(simulation.gripperTarget);
