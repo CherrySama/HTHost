@@ -3,7 +3,9 @@
 import json
 import math
 import multiprocessing
+import os
 import signal
+import subprocess
 import sys
 import time
 import uuid
@@ -24,6 +26,7 @@ ENDPOINT = "/api/panthera/connection"
 POSITION_ENDPOINT = "/api/panthera/position"
 PAUSE_POSITION_ENDPOINT = "/api/panthera/position/pause"
 MODE_ENDPOINT = "/api/panthera/mode"
+CALIBRATION_ENDPOINT = "/api/panthera/calibration/zero"
 ACTION_ENDPOINT = "/api/panthera/actions"
 STOP_ACTION_ENDPOINT = "/api/panthera/actions/stop"
 ESTIMATE_ACTION_ENDPOINT = "/api/panthera/actions/estimate"
@@ -50,6 +53,12 @@ CONTROL_MODES = ("position", "gravity", "gravity_friction", "impedance")
 # Position commands can move, stop in place, or hold when explicitly selecting the mode.
 MOVE_POSITION, PAUSE_POSITION, STREAM_POSITION, SDK_SINE, SDK_REPLAY = range(len(CONTROL_MODES), len(CONTROL_MODES) + 5)
 NATIVE_MODES = (SDK_SINE, SDK_REPLAY)
+WRITE_ZERO = SDK_REPLAY + 1
+ZERO_TOLERANCE = 0.01
+ZERO_STILL_SECONDS = 0.3
+ZERO_WRITE_TIMEOUT = 30
+ZERO_VERIFY_TIMEOUT = 3
+ZERO_QUEUED, ZERO_WRITING, ZERO_VERIFYING, ZERO_DONE, ZERO_REJECTED, ZERO_UNVERIFIED = range(1, 7)
 POSITION_ACTIONS = (MOVE_POSITION, PAUSE_POSITION)
 POSITION_TOLERANCE = 0.01
 POSITION_SETTLE_SPEED = 0.03
@@ -81,6 +90,7 @@ class RobotSession:
         self.command = context.Array("d", [0, POSITION, 0, 0, math.nan, 0, *([0] * ARM_JOINTS)])
         self.trajectory = context.RawArray("d", MAX_NATIVE_FRAMES * NATIVE_WIDTH)
         self.last_status_request = context.Value("d", 0, lock=False)
+        self.zero = context.Array("d", [0, 0, *([math.nan] * MOTOR_SLOTS)])
 
 
 class TorqueControl:
@@ -169,11 +179,31 @@ def send_sdk_target(robot, mode, target, measured):
         raise RuntimeError("SDK 拒绝了关节回放目标")
 
 
+def external_serial_owners(ports):
+    # fuser also matches aliases of the same character device.
+    try:
+        result = subprocess.run(["fuser", *map(str, ports)], capture_output=True,
+                                text=True, timeout=2, check=False)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise RuntimeError("无法检查机械臂串口占用，请确认系统的 fuser 可用") from exc
+    if result.returncode == 1 and not result.stdout.strip() and not result.stderr.strip():
+        return []
+    owners = result.stdout.split()
+    if result.returncode != 0 or not owners or not all(pid.isdecimal() for pid in owners):
+        raise RuntimeError("无法确认机械臂串口占用状态")
+    return sorted({int(pid) for pid in owners} - {os.getpid()})
+
+
 def monitor_robot(session, errors):
     stop = session.stop
     try:
-        if not any(port.is_char_device() for port in Path("/dev").glob("ttyACM*")):
+        ports = sorted(port for port in Path("/dev").glob("ttyACM*") if port.is_char_device())
+        if not ports:
             raise RuntimeError("未找到机械臂 USB 控制板")
+        owners = external_serial_owners(ports)
+        if owners:
+            raise RuntimeError("机械臂串口已被其他程序占用，请退出 SDK 脚本后重连（PID "
+                               + "、".join(map(str, owners)) + "）")
 
         sys.path.insert(0, str(SDK / "scripts"))
         from Panthera_lib.Panthera import Panthera
@@ -229,6 +259,9 @@ def monitor_robot(session, errors):
         native_mode = None
         native_index = 0
         native_started = 0
+        still_since = None
+        zero_verify_deadline = 0
+        zero_samples = 0
         position_tolerance = float(robot.config.get("control", {}).get("position_tolerance", 0.01))
         last_complete = time.monotonic()
         parent = multiprocessing.parent_process()
@@ -264,13 +297,57 @@ def monitor_robot(session, errors):
                 if not robot.gripper_installed:
                     measured.append((math.nan, math.nan, math.nan, 0, 0))
                 positions, velocities, torques, motor_modes, motor_faults = zip(*measured)
+                still = all(abs(value) <= POSITION_SETTLE_SPEED for value in velocities[:len(motors)])
+                still_since = (now if still_since is None else still_since) if still else None
+                session.zero[1] = still_since if still_since is not None else 0
                 session.feedback[:] = [
                     now, confirmed_mode, rejected_mode_id, applied_command_id, applied_at, completed_position_id,
                     *positions, *velocities, *torques, *applied_targets, *motor_modes, *motor_faults,
                 ]
                 pending = {motor.get_motor_id(): motor for motor in motors}
+                if zero_verify_deadline:
+                    at_zero = [abs(value) <= ZERO_TOLERANCE for value in positions[:len(motors)]]
+                    healthy = not any(motor_faults)
+                    zero_samples = zero_samples + 1 if all(at_zero) and still and healthy else 0
+                    phase = ZERO_VERIFYING
+                    if zero_samples >= 3:
+                        phase = ZERO_DONE
+                    elif not healthy or now >= zero_verify_deadline:
+                        phase = ZERO_UNVERIFIED
+                    session.zero[:] = [phase, session.zero[1], *positions]
+                    if phase != ZERO_VERIFYING:
+                        zero_verify_deadline = 0
+                    continue
                 next_id, mode, speed, next_gripper_speed, next_gripper, deadline, *next_target = session.command[:]
                 accept_command = next_id != command_id
+                if accept_command and mode == WRITE_ZERO:
+                    command_id = next_id
+                    if (confirmed_mode != POSITION or torque_control or native_mode or any(motor_faults)
+                            or still_since is None or now - still_since < ZERO_STILL_SECONDS
+                            or any(abs(actual - expected) > ZERO_TOLERANCE
+                                   for actual, expected in zip(positions[:ARM_JOINTS], next_target))
+                            or (robot.gripper_installed and abs(positions[-1] - next_gripper) > ZERO_TOLERANCE)):
+                        session.zero[0] = ZERO_REJECTED
+                        continue
+                    if stop.is_set() or now - session.last_status_request.value > CONTROL_LEASE:
+                        session.zero[0] = ZERO_REJECTED
+                        continue
+                    target = None
+                    gripper_target = math.nan
+                    applied_targets = [math.nan] * MOTOR_SLOTS
+                    tracking_position = False
+                    session.zero[0] = ZERO_WRITING
+                    robot.set_reset_zero()
+                    robot.motor_send_cmd()
+                    # A pre-write packet cannot verify a new zero.
+                    timestamps = {motor_id: motor.get_current_motor_state().time
+                                  for motor_id, motor in pending.items()}
+                    last_complete = time.monotonic()
+                    zero_verify_deadline = last_complete + ZERO_VERIFY_TIMEOUT
+                    zero_samples = 0
+                    still_since = None
+                    session.zero[:] = [ZERO_VERIFYING, 0, *([math.nan] * MOTOR_SLOTS)]
+                    continue
                 if accept_command and mode == IMPEDANCE:
                     if waiting_impedance_id != next_id:
                         waiting_impedance_id = next_id
@@ -433,6 +510,11 @@ def monitor_robot(session, errors):
                         applied_at = now
                 elif stop.wait(0.06):
                     break
+            elif zero_verify_deadline and now >= zero_verify_deadline:
+                session.zero[0] = ZERO_UNVERIFIED
+                zero_verify_deadline = 0
+            elif zero_verify_deadline:
+                continue
             elif now - last_complete > (TORQUE_FEEDBACK_TIMEOUT if torque_control or native_mode else FEEDBACK_TIMEOUT):
                 missing = "、".join(motor.get_motor_name() for motor in pending.values())
                 raise RuntimeError(f"未收到电机反馈（{missing}）")
@@ -453,6 +535,8 @@ class RobotConnection:
         self.worker = None
         self.message = ""
         self.return_deadline = 0
+        self.zero_deadline = 0
+        self.zero_failure = None
         self.action = None
         self.recording = None
 
@@ -461,6 +545,7 @@ class RobotConnection:
             self._status()
             if self.worker is None:
                 self.message = ""
+                self.zero_failure = None
                 self.action = None
                 self.recording = None
                 self.session = RobotSession(self.context)
@@ -483,14 +568,47 @@ class RobotConnection:
         with self.lock:
             self._stop_worker()
             self.message = ""
+            self.zero_failure = None
             return self._status()
 
     def status(self):
         with self.lock:
             status = self._status()
-            if status["state"] in ("connected", "homing"):
+            if status["state"] in ("connected", "homing", "calibrating"):
                 self.session.last_status_request.value = time.monotonic()
             return status
+
+    def write_zero(self, request):
+        with self.lock:
+            status = self._status()
+            if status["state"] != "connected" or request.get("session") != status["session"]:
+                return 409, {"message": "真机当前无法写入零位"}
+            if not status["calibration"]["ready"]:
+                return 409, {"message": "请等待电机静止、反馈正常且其他控制结束"}
+            expected = request.get("positions")
+            motors = status["motors"]
+            if (not isinstance(expected, list) or len(expected) != len(motors)
+                    or any(not is_finite_number(value) or abs(value - motor["position"]) > ZERO_TOLERANCE
+                           for value, motor in zip(expected, motors))):
+                return 409, {"message": "电机位置已变化，请重新核对校准姿态"}
+            session = self.session
+            now = time.monotonic()
+            self.zero_deadline = now + ZERO_WRITE_TIMEOUT
+            session.zero[:] = [ZERO_QUEUED, 0, *([math.nan] * MOTOR_SLOTS)]
+            session.last_status_request.value = now
+            session.command[:] = [session.command[0] + 1, WRITE_ZERO, 0, 0,
+                                  expected[-1] if len(expected) == MOTOR_SLOTS else math.nan,
+                                  0, *expected[:ARM_JOINTS]]
+            Thread(target=self._watch_zero, args=(session,), daemon=True).start()
+            return 202, {"phase": "queued"}
+
+    def _watch_zero(self, session):
+        while True:
+            with self.lock:
+                if self.worker is None or self.session is not session or not self.zero_deadline:
+                    return
+                self._status()
+            time.sleep(0.2)
 
     def set_position(self, request):
         with self.lock:
@@ -818,11 +936,21 @@ class RobotConnection:
                 self.message = "Panthera SDK 进程已退出"
 
             now = time.monotonic()
+            zero_phase, still_since, *zero_positions = self.session.zero[:]
+            zero_active = zero_phase in (ZERO_QUEUED, ZERO_WRITING, ZERO_VERIFYING)
+            if zero_active and now >= self.zero_deadline:
+                self.message = "零位写入或反馈验证超时，请核对电机零位后再控制"
+            elif zero_active and self.message:
+                self.message = "零位结果未确认：" + self.message
+            elif zero_phase == ZERO_UNVERIFIED:
+                self.message = "零位反馈未通过验证，请核对各电机零位后再控制"
+            elif not zero_active:
+                self.zero_deadline = 0
             last_feedback, confirmed_mode, rejected_id, applied_id, applied_at, completed_id, *feedback = self.session.feedback[:]
             if not self.message:
                 if self.return_deadline and now >= self.return_deadline:
                     self.message = "等待到位超时"
-                elif last_feedback and now - last_feedback > FEEDBACK_TIMEOUT + 1:
+                elif not zero_active and last_feedback and now - last_feedback > FEEDBACK_TIMEOUT + 1:
                     self.message = "机械臂反馈超时"
                 elif not last_feedback and now - self.started > STARTUP_TIMEOUT:
                     self.message = "机械臂连接超时"
@@ -832,7 +960,7 @@ class RobotConnection:
                     mode = CONTROL_MODES[int(confirmed_mode)]
                     request_id, requested_code = self.session.command[:2]
                     position_phase = None
-                    if requested_code in (*POSITION_ACTIONS, STREAM_POSITION, *NATIVE_MODES):
+                    if requested_code in (*POSITION_ACTIONS, STREAM_POSITION, WRITE_ZERO, *NATIVE_MODES):
                         requested_mode = "position"
                         if requested_code in POSITION_ACTIONS and request_id != completed_id:
                             position_phase = "settling" if requested_code == PAUSE_POSITION else "moving"
@@ -874,8 +1002,21 @@ class RobotConnection:
                             else "已到达目标，保持当前位置",
                         }
                     pending_mode = requested_mode if requested_mode != mode and not rejected else None
+                    calibration = {
+                        "phase": ("idle", "queued", "writing", "verifying", "done", "rejected", "unverified")[int(zero_phase)],
+                        "ready": bool(not zero_active and mode == "position" and not pending_mode
+                                      and not position_phase and not self.return_deadline
+                                      and not (self.action and self.action.active)
+                                      and not (self.recording and self.recording.active)
+                                      and now - last_feedback < 0.25 and still_since
+                                      and last_feedback - still_since >= ZERO_STILL_SECONDS
+                                      and not any(motor_faults)),
+                        "positions": [value if math.isfinite(value) else None for value in zero_positions[:len(motors)]],
+                        "tolerance": ZERO_TOLERANCE,
+                    }
                     return {
-                        "state": "homing" if self.return_deadline else "connected",
+                        "state": "calibrating" if zero_active else "homing" if self.return_deadline else "connected",
+                        "calibration": calibration,
                         "session": self.session.id,
                         "mode": mode,
                         "pendingMode": pending_mode,
@@ -896,10 +1037,17 @@ class RobotConnection:
                     }
             if self.return_deadline:
                 self.message = f"回零未完成：{self.message}"
+            if zero_active or zero_phase == ZERO_UNVERIFIED:
+                self.zero_deadline = 0
+                self.zero_failure = {
+                    "phase": "unverified",
+                    "positions": [value if math.isfinite(value) else None for value in zero_positions],
+                    "tolerance": ZERO_TOLERANCE,
+                }
             self._stop_worker()
 
         if self.message:
-            return {"state": "error", "message": self.message}
+            return {"state": "error", "message": self.message, "calibration": self.zero_failure}
         return {"state": "disconnected"}
 
     def _stop_worker(self):
@@ -972,6 +1120,8 @@ class Handler(BaseHTTPRequestHandler):
             self.respond_with_request(self.server.robot.pause_position)
         elif self.path == MODE_ENDPOINT:
             self.respond_with_request(self.server.robot.set_mode)
+        elif self.path == CALIBRATION_ENDPOINT:
+            self.respond_with_request(self.server.robot.write_zero)
         elif self.path == ACTION_ENDPOINT:
             self.respond_with_request(self.server.robot.start_action, max_length=1_500_000)
         elif self.path == ESTIMATE_ACTION_ENDPOINT:

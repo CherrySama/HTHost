@@ -30,13 +30,27 @@ const formatValue = (value) => Number.isFinite(value)
   : "—";
 
 export class MotorTelemetry {
-  constructor(root, labels) {
+  constructor(root, labels, writeZero) {
     this.root = root;
     this.selected = 0;
     this.history = [];
     this.paused = false;
     root.innerHTML = `<div class="panel-heading"><div><div class="eyebrow">MOTOR TELEMETRY</div><h2>电机监控</h2></div><span class="data-source">仿真数据</span></div>
-      <p class="monitor-intro">选择关节，查看最近 15 秒的运动与输出。</p>
+      <section class="motor-overview" hidden>
+        <table aria-label="实时电机状态">
+          <thead><tr><th scope="col">电机</th><th scope="col">位置<br><small>rad</small></th><th scope="col">速度<br><small>rad/s</small></th><th scope="col">力矩<br><small>N·m</small></th><th scope="col">状态</th></tr></thead>
+          <tbody>${[...labels.map((_, i) => "J" + (i + 1)), "夹爪"].map((name, i) => `<tr>
+            <th scope="row"><button type="button" data-motor="${i}">${name}</button></th>
+            <td></td><td></td><td></td><td></td></tr>`).join("")}</tbody>
+        </table>
+        <details class="motor-calibration">
+          <summary>零位校准</summary>
+          <p>核对表中位置，将六轴摆到机械零位，已安装的夹爪摆到闭合位置。</p>
+          <button type="button" id="monitor-write-zero" disabled>写入零位</button>
+          <p id="monitor-calibration-status" role="status"></p>
+        </details>
+      </section>
+      <p class="monitor-intro">选择电机，查看最近 15 秒的运动与输出。 <span id="monitor-drive" hidden></span></p>
       <label class="motor-picker" for="monitor-joint"><span>监控电机</span><select id="monitor-joint">${labels.map((label, index) => `<option value="${index}">J${index + 1} · ${label}</option>`).join("")}</select></label>
       <div class="monitor-state"><span id="monitor-state">实时采样</span><span><span id="monitor-clock">仿真时间</span> <output id="monitor-time">0.0 s</output></span></div>
       <div class="motor-charts">${CHARTS.map(
@@ -49,6 +63,38 @@ export class MotorTelemetry {
       <p class="monitor-note">力矩为 MuJoCo 执行器输出，误差 = 目标 − 实际。<br>当前未连接真实电机。</p>`;
     this.select = root.querySelector("select");
     this.armCount = labels.length;
+    this.overview = root.querySelector(".motor-overview");
+    this.rows = [...this.overview.querySelectorAll("tbody tr")];
+    this.writeButton = root.querySelector("#monitor-write-zero");
+    this.calibrationStatus = root.querySelector("#monitor-calibration-status");
+    this.drive = root.querySelector("#monitor-drive");
+    this.calibrationPanel = root.querySelector(".motor-calibration");
+    this.calibrationPanel.ontoggle = () => this.render();
+    this.rows.forEach((row, i) => {
+      row.querySelector("button").onclick = () => {
+        this.select.value = i;
+        this.selected = i;
+        this.render();
+      };
+    });
+    this.writeButton.onclick = async () => {
+      if (this.writeButton.disabled) return;
+      const positions = this.latest.joints.map((joint) => joint.position);
+      if (!window.confirm("将当前姿态写为六轴及已安装夹爪的新零位。请确认已核对姿态并支撑好机械臂。确定写入吗？")) return;
+      const previous = this.calibration;
+      this.zeroSubmitting = true;
+      this.zeroRequestError = "";
+      this.renderCalibration();
+      try {
+        const result = await writeZero(positions);
+        if (this.calibration === previous || this.calibration?.ready) this.calibration = result;
+      } catch (error) {
+        this.zeroRequestError = error.message;
+      } finally {
+        this.zeroSubmitting = false;
+        this.renderCalibration();
+      }
+    };
     this.select.addEventListener("change", () => {
       this.selected = Number(this.select.value);
       this.render();
@@ -66,7 +112,11 @@ export class MotorTelemetry {
       sample.source !== this.latest.source ||
       sample.session !== this.latest.session ||
       sample.time < this.latest.time
-    )) this.history = [];
+    )) {
+      this.history = [];
+      this.calibration = null;
+      this.zeroRequestError = "";
+    }
     const gripperOption = this.select.options[this.armCount];
     if (sample.joints.length > this.armCount && !gripperOption) {
       this.select.add(new Option("夹爪", this.armCount));
@@ -110,17 +160,71 @@ export class MotorTelemetry {
     this.render();
   }
 
+  updateCalibration(calibration) {
+    if (calibration?.phase !== this.calibration?.phase) this.zeroRequestError = "";
+    this.calibration = calibration;
+    this.render();
+  }
+
+  renderCalibration() {
+    const result = this.calibration;
+    this.writeButton.disabled = this.disconnected || this.zeroSubmitting || !result?.ready;
+    const messages = {
+      queued: "正在等待写入…", writing: "正在写入零位…", verifying: "正在核对电机反馈…",
+      done: "全部电机反馈已通过零位验证。",
+      rejected: "姿态或电机状态已变化，本次未写入。",
+      unverified: "零位结果未确认，请核对各电机反馈。",
+    };
+    const message = this.zeroRequestError || (this.zeroSubmitting ? messages.queued
+      : messages[result?.phase] || (result?.ready ? "" : "请在位置模式下等待电机停稳。"));
+    if (this.calibrationStatus.textContent !== message) this.calibrationStatus.textContent = message;
+  }
+
   render() {
     if (this.root.hidden || !this.latest) return;
     const joint = this.latest.joints[this.selected];
     const live = this.latest.source === "robot";
-    this.root.querySelector(".data-source").textContent = live ? "真机数据" : "仿真数据";
+    const zeroPausesSampling = live && !this.disconnected &&
+      ["queued", "writing"].includes(this.calibration?.phase);
+    this.overview.hidden = !live;
+    this.drive.hidden = !live;
+    if (live) {
+      this.drive.textContent = "驱动模式 " + (joint.driveMode ?? "—");
+      const result = this.calibration;
+      this.rows.forEach((row, i) => {
+        const motor = this.latest.joints[i];
+        row.hidden = !motor;
+        if (!motor) return;
+        const position = result?.positions?.[i];
+        const checked = this.calibrationPanel.open && ["done", "unverified"].includes(result?.phase);
+        const failed = checked && (!Number.isFinite(position) || Math.abs(position) > result.tolerance);
+        const fault = Number.isInteger(motor.fault) && motor.fault !== 0;
+        const state = zeroPausesSampling ? "已暂停"
+          : fault ? "0x" + motor.fault.toString(16).toUpperCase().padStart(2, "0")
+          : this.disconnected && !checked ? "已失联"
+          : checked ? failed ? "未确认" : "零位已验" : Number.isInteger(motor.fault) ? "正常" : "—";
+        row.classList.toggle("motor-fault", fault || failed);
+        row.querySelector("button").setAttribute("aria-pressed", String(i === this.selected));
+        row.cells[4].title = checked ? "校准反馈 " + formatValue(position) + " rad" : "";
+        [motor.position, motor.velocity, motor.torque].map(formatValue)
+          .concat(state).forEach((value, j) => {
+            if (row.cells[j + 1].textContent !== value) row.cells[j + 1].textContent = value;
+          });
+      });
+    }
+    this.renderCalibration();
+    this.root.querySelector(".data-source").textContent = zeroPausesSampling
+      ? "采样暂停" : live ? "真机数据" : "仿真数据";
     this.root.querySelector("#monitor-clock").textContent = live ? "连接时长" : "仿真时间";
     this.root.querySelector(".monitor-note").textContent = live
       ? "力矩来自电机反馈。位置误差 = 已下发目标 − 实际角度。"
       : "力矩为 MuJoCo 执行器输出，误差 = 目标 − 实际。";
     this.root.querySelector("#monitor-state").textContent = this.disconnected
       ? "已失联 · 历史保留"
+      : zeroPausesSampling
+      ? "采样暂停 · 保留写入前反馈"
+      : live && this.calibration?.phase === "verifying"
+      ? "已恢复采样 · 正在验证零位"
       : this.paused
       ? "已暂停 · 历史保留"
       : "实时采样";

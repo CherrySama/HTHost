@@ -428,6 +428,60 @@ aside {
   color: #86868b;
   margin: 12px 0 20px;
 }
+.motor-overview {
+  margin-top: 14px;
+}
+.motor-overview table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+}
+.motor-overview th, .motor-overview td {
+  padding: 5px 3px;
+  border-bottom: 1px solid #ededf0;
+  text-align: right;
+}
+.motor-overview th:first-child {
+  text-align: left;
+}
+.motor-overview thead th {
+  color: #55555c;
+}
+.motor-overview thead small {
+  color: #74747d;
+  font-weight: normal;
+}
+.motor-overview tr.motor-fault {
+  color: #a42620;
+  background: #fff0ef;
+}
+.motor-overview button {
+  padding: 4px 6px;
+  border: 1px solid #e3e4e8;
+  border-radius: 6px;
+  background: #f7f7f9;
+  font: inherit;
+  color: inherit;
+}
+.motor-overview button[aria-pressed="true"] {
+  background: #edf5ff;
+  color: #005bb9;
+}
+.motor-calibration {
+  margin-top: 12px;
+  padding: 8px;
+  border: 1px solid #e5e5eb;
+  border-radius: 8px;
+  font-size: 11px;
+}
+.motor-calibration summary {
+  cursor: pointer;
+}
+.motor-calibration p {
+  margin: 7px 0;
+  color: #55555c;
+}
 .motor-picker {
   display: flex;
   align-items: center;

@@ -4,20 +4,33 @@ import surfaceUrl from "./filament-materials/surface.filamat?url";
 import fadeUrl from "./filament-materials/surface-fade.filamat?url";
 import overlayUrl from "./filament-materials/overlay.filamat?url";
 
+const LOAD_TIMEOUT_MS = 15000;
+const WEBGL_OPTIONS = { antialias: false, depth: true, alpha: false };
 let runtime;
 
-function loadFilament() {
+function loadFilament(signal) {
   runtime ??= new Promise((resolve, reject) => {
     const script = document.createElement("script");
     script.src = scriptUrl;
-    script.onload = resolve;
-    script.onerror = () => reject(new Error("Filament 脚本加载失败"));
+    const abort = () => {
+      script.remove();
+      reject(new Error("Filament 脚本加载超时"));
+    };
+    script.onload = () => {
+      signal.removeEventListener("abort", abort);
+      resolve(window.Filament);
+    };
+    script.onerror = () => {
+      signal.removeEventListener("abort", abort);
+      reject(new Error("Filament 脚本加载失败"));
+    };
+    signal.addEventListener("abort", abort, { once: true });
     document.head.append(script);
-  }).then(async () => {
-    // The pinned browser build exposes its Emscripten factory as a global.
-    // Pass Vite's asset URL to the factory and install the package's JS extensions.
-    const factory = window.Filament;
-    const filament = await factory({ locateFile: () => wasmUrl });
+  }).then(async (factory) => {
+    if (typeof factory !== "function") throw new Error("Filament 脚本未提供初始化入口");
+    const wasmBinary = await loadAsset(wasmUrl, "Filament WASM", signal);
+    const filament = await factory({ wasmBinary });
+    signal.throwIfAborted();
     window.Filament = Object.assign(filament, factory);
     filament.loadClassExtensions();
     return filament;
@@ -25,24 +38,48 @@ function loadFilament() {
   return runtime;
 }
 
-async function loadMaterial(url) {
-  const response = await fetch(url);
-  if (!response.ok) throw new Error("Filament 材质加载失败");
-  return new Uint8Array(await response.arrayBuffer());
+async function loadAsset(url, name, signal) {
+  try {
+    const response = await fetch(url, { signal });
+    if (!response.ok) throw new Error("HTTP " + response.status);
+    return new Uint8Array(await response.arrayBuffer());
+  } catch (error) {
+    throw new Error(name + (signal.aborted ? "加载超时" : "加载失败"), { cause: error });
+  }
 }
 
 export class FilamentRenderer {
   static async create() {
-    const [filament, ...materials] = await Promise.all([
-      loadFilament(), loadMaterial(surfaceUrl), loadMaterial(fadeUrl), loadMaterial(overlayUrl),
-    ]);
-    return new FilamentRenderer(filament, materials);
+    const canvas = document.createElement("canvas");
+    if (!canvas.getContext("webgl2", WEBGL_OPTIONS)) {
+      throw new Error("Chrome 无法创建 WebGL 2 图形上下文。请检查 chrome://gpu 中的 WebGL 2 状态，或重启 Chrome 后重试。");
+    }
+    const controller = new AbortController();
+    const { signal } = controller;
+    let timer;
+    try {
+      const deadline = new Promise((_, reject) => {
+        timer = setTimeout(() => {
+          controller.abort();
+          reject(new Error("Filament 渲染器加载或初始化超时"));
+        }, LOAD_TIMEOUT_MS);
+      });
+      const [filament, ...materials] = await Promise.race([
+        Promise.all([loadFilament(signal), ...[surfaceUrl, fadeUrl, overlayUrl]
+          .map((url) => loadAsset(url, "Filament 材质", signal))]),
+        deadline,
+      ]);
+      return new FilamentRenderer(filament, materials, canvas);
+    } finally {
+      clearTimeout(timer);
+      controller.abort();
+    }
   }
 
-  constructor(filament, materials) {
+  constructor(filament, materials, canvas) {
     this.filament = filament;
-    this.domElement = document.createElement("canvas");
-    this.engine = filament.Engine.create(this.domElement);
+    this.domElement = canvas;
+    this.engine = filament.Engine.create(canvas, WEBGL_OPTIONS);
     this.renderer = this.engine.createRenderer();
     this.renderer.setClearOptions({ clear: true, clearColor: [0.91, 0.91, 0.93, 1] });
     this.scene = this.engine.createScene();

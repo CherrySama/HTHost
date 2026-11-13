@@ -28,7 +28,7 @@ document.querySelector("#app").innerHTML = `
         <span class="axis-z">Z 轴</span>
       </div>
     </div>
-    <div id="loading" role="status"><span class="spinner"></span><span id="load-message">正在准备工作空间…</span></div>
+    <div id="loading"><span class="spinner"></span><span id="load-message" role="status">正在准备工作空间…</span><button type="button" id="retry-loading" hidden>重试</button></div>
     <div class="scene-footer"><span><i class="live-dot"></i><span id="status">正在加载</span></span><span>拖动旋转 · 滚轮缩放 · 右键平移</span></div>
   </section>
   <aside><nav class="sidebar-tabs" role="tablist" aria-label="侧边面板"><button id="control-tab" role="tab" aria-selected="true" aria-controls="control-panel">关节控制</button><button id="monitor-tab" role="tab" aria-selected="false" aria-controls="motor-monitor" tabindex="-1" disabled>电机监控</button><button id="sdk-tab" role="tab" aria-selected="false" aria-controls="sdk-panel" tabindex="-1" disabled>SDK 脚本</button></nav>
@@ -88,6 +88,7 @@ const robotStatusLabels = {
   connected: "已连接",
   disconnecting: "断开中…",
   homing: "回零中…",
+  calibrating: "正在校准零位…",
   error: "连接失败",
 };
 let robotStatusTimer;
@@ -111,18 +112,21 @@ const modeDescriptions = {
   impedance: "机械臂会柔顺地保持切换时的姿态。",
 };
 
-function showRobotStatus({ state, message }) {
+function showRobotStatus({ state, message, calibration }) {
   const stateChanged = robotConnection.dataset.state !== state;
   robotConnection.dataset.state = state;
   const text = message || robotStatusLabels[state];
   if (robotStatus.textContent !== text) robotStatus.textContent = text;
   robotButton.disabled = Boolean(sdk?.locked() || sdk?.recordingNow())
-    || ["connecting", "disconnecting", "homing"].includes(state);
-  const buttonText = ["connected", "disconnecting", "homing"].includes(state)
+    || ["connecting", "disconnecting", "homing", "calibrating"].includes(state);
+  const buttonText = ["connected", "disconnecting", "homing", "calibrating"].includes(state)
     ? "断开真机"
     : "连接真机";
   if (robotButton.textContent !== buttonText) robotButton.textContent = buttonText;
-  if (state === "error") telemetry?.markDisconnected();
+  if (state === "error") {
+    telemetry?.markDisconnected();
+    telemetry?.updateCalibration(calibration);
+  }
   if (state === "error" || state === "disconnected") {
     requestedMode = undefined;
     sdk?.updateHardware(null, true);
@@ -150,13 +154,13 @@ async function refreshRobotStatus(method = "GET", initial = false) {
       return;
     }
     if (!response.ok) throw new Error("连接服务不可用");
-    if (status.state === "connected" || status.state === "homing") receiveRobotPose(status);
+    if (["connected", "homing", "calibrating"].includes(status.state)) receiveRobotPose(status);
     if (status.state === "disconnected" && robotPose) {
       robotPose = undefined;
       updateMotionControls();
     }
     showRobotStatus(status);
-    if (["connecting", "connected", "homing"].includes(status.state)) {
+    if (["connecting", "connected", "homing", "calibrating"].includes(status.state)) {
       robotStatusTimer = setTimeout(refreshRobotStatus, status.state === "connecting" ? 500 : 100);
     }
   } catch {
@@ -294,6 +298,7 @@ function receiveRobotPose(status) {
     !robotPose?.positionStatus?.completed || robotPose.positionStatus.commandId !== positionStatus.commandId
   );
   const modeRejected = status.modeMessage && status.modeMessage !== robotPose?.modeMessage;
+  const zeroWritten = status.calibration?.phase === "done" && robotPose?.calibration?.phase !== "done";
   robotPose = status;
   if (newSession) {
     sdk?.updateHardware(null, true);
@@ -305,7 +310,11 @@ function receiveRobotPose(status) {
     pausingPosition = false;
   }
   if (newSession || mode === requestedMode || modeRejected) requestedMode = undefined;
-  if (newSession || modeChanged || positionCompleted) {
+  if (newSession || modeChanged || positionCompleted || zeroWritten) {
+    if (zeroWritten) {
+      sdk?.clearPreview();
+      telemetry.history = [];
+    }
     if (tcpEnabled) setTcpEnabled(false);
     positionCommandId = undefined;
     const holdTargets = status.motors.slice(0, labels.length).map((motor) => motor.target);
@@ -360,7 +369,8 @@ function receiveRobotPose(status) {
         name: index < labels.length ? `J${index + 1}` : "夹爪",
         error: motor.target === null ? null : motor.target - motor.position,
       })),
-    }, false);
+    }, ["queued", "writing"].includes(status.calibration?.phase));
+    telemetry.updateCalibration(status.calibration);
   }
 }
 
@@ -412,6 +422,7 @@ function updateMotionControls() {
   document.querySelector("#joint-intro").textContent = realView
     ? (state === "homing" ? "正在回零，到位后自动断开。"
       : state === "error" ? "真机连接中断。"
+      : state === "calibrating" ? "正在校准零位，请保持机械臂姿态。"
       : settling ? "正在停稳，随后保持当前位置…"
       : moving ? "位置运动中，到位后保持目标角度。"
       : switchingTo === "impedance" ? "等待关节稳定后切入阻抗…"
@@ -453,7 +464,7 @@ function updateMotionControls() {
     telemetry.update(simulation.getMotorTelemetry(), simulation.paused);
   }
   robotButton.disabled = Boolean(sdkLocked || sdkRecording)
-    || ["connecting", "disconnecting", "homing"].includes(state);
+    || ["connecting", "disconnecting", "homing", "calibrating"].includes(state);
   document.querySelector("#reset").disabled = Boolean(sdkLocked || sdkRecording);
   sdk?.refresh();
   updateTargetPreview();
@@ -502,8 +513,8 @@ function previewSdkAction(point, start, points, context) {
   viewer.setTargetPreview(simulation.setTargetPreview(point.positions, point.gripper), actual);
 }
 
-async function postSdkAction(path, payload) {
-  const response = await fetch("/api/panthera/actions" + path, {
+async function postPanthera(path, payload) {
+  const response = await fetch("/api/panthera" + path, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(payload),
@@ -513,6 +524,8 @@ async function postSdkAction(path, payload) {
   if (!response.ok) throw new Error(result.message || "真机动作请求失败");
   return result;
 }
+
+const postSdkAction = (path, payload) => postPanthera("/actions" + path, payload);
 
 for (const button of robotModeButtons) {
   button.onclick = async () => {
@@ -870,13 +883,24 @@ tabs.forEach((tab, index) => {
     }
   };
 });
+const loadMessage = document.querySelector("#load-message");
+let startupFailed = false;
+function showLoadProgress(message) {
+  if (!startupFailed) loadMessage.textContent = message;
+}
+document.querySelector("#retry-loading").onclick = () => window.location.reload();
 try {
+  let rendererReady = false;
   [viewer] = await Promise.all([
-    Viewer.create(document.querySelector("#viewport")),
-    simulation.init((message) => {
-      document.querySelector("#load-message").textContent = message;
+    Viewer.create(document.querySelector("#viewport")).then((result) => {
+      rendererReady = true;
+      return result;
+    }),
+    simulation.init(showLoadProgress).then(() => {
+      if (!rendererReady) showLoadProgress("机械臂模型已编译 · 正在初始化 Filament 渲染器…");
     }),
   ]);
+  showLoadProgress("正在构建机械臂视图…");
   viewer.load(
     simulation.model,
     simulation.highlightBodies,
@@ -899,6 +923,12 @@ try {
   telemetry = new MotorTelemetry(
     document.querySelector("#motor-monitor"),
     labels,
+    async (positions) => {
+      const result = await postPanthera("/calibration/zero", { session: robotPose?.session, positions });
+      clearTimeout(robotStatusTimer);
+      void refreshRobotStatus();
+      return result;
+    },
   );
   telemetry.update(simulation.getMotorTelemetry(), simulation.paused);
   document.querySelector("#monitor-tab").disabled = false;
@@ -926,10 +956,13 @@ try {
   // Diagnostic access for browser verification.
   window.panthera = { simulation, viewer, telemetry };
 } catch (error) {
+  startupFailed = true;
   console.error(error);
-  document.querySelector("#loading").classList.add("error");
-  document.querySelector("#load-message").textContent =
-    `加载失败：${error.message}。请刷新重试。`;
+  const loading = document.querySelector("#loading");
+  loading.hidden = false;
+  loading.classList.add("error");
+  loadMessage.textContent = `加载失败：${error.message || error}`;
+  document.querySelector("#retry-loading").hidden = false;
 }
 
 let previous = performance.now(),
