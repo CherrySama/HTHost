@@ -3,6 +3,7 @@ import { Simulation } from "./simulation.js";
 import { Viewer } from "./viewer.js";
 import { MotorTelemetry } from "./motor-telemetry.js";
 import { gripperOpening } from "./gripper-calibration.js";
+import { createSdkPanel, sdkPanel } from "./sdk-panel.js";
 
 document.querySelector("#app").innerHTML = `
   <header><a class="brand" href="/" aria-label="Panthera Studio 首页"><span class="brand-icon">P</span>Panthera <span>Studio</span></a>
@@ -21,11 +22,16 @@ document.querySelector("#app").innerHTML = `
       <button data-overlay="centerOfMass" aria-pressed="false" disabled>质心</button>
       <button data-overlay="bodyAxes" aria-pressed="false" disabled>坐标轴</button>
       <button data-overlay="jointAxes" aria-pressed="false" disabled>关节轴</button>
+      <div class="axis-legend" aria-label="坐标轴颜色">
+        <span class="axis-x">X 轴</span>
+        <span class="axis-y">Y 轴</span>
+        <span class="axis-z">Z 轴</span>
+      </div>
     </div>
     <div id="loading" role="status"><span class="spinner"></span><span id="load-message">正在准备工作空间…</span></div>
     <div class="scene-footer"><span><i class="live-dot"></i><span id="status">正在加载</span></span><span>拖动旋转 · 滚轮缩放 · 右键平移</span></div>
   </section>
-  <aside><nav class="sidebar-tabs" role="tablist" aria-label="侧边面板"><button id="control-tab" role="tab" aria-selected="true" aria-controls="control-panel">关节控制</button><button id="monitor-tab" role="tab" aria-selected="false" aria-controls="motor-monitor" tabindex="-1" disabled>电机监控</button></nav>
+  <aside><nav class="sidebar-tabs" role="tablist" aria-label="侧边面板"><button id="control-tab" role="tab" aria-selected="true" aria-controls="control-panel">关节控制</button><button id="monitor-tab" role="tab" aria-selected="false" aria-controls="motor-monitor" tabindex="-1" disabled>电机监控</button><button id="sdk-tab" role="tab" aria-selected="false" aria-controls="sdk-panel" tabindex="-1" disabled>SDK 示例</button></nav>
     <section class="sidebar-panel" id="control-panel" role="tabpanel" aria-labelledby="control-tab">
     <div class="panel-heading">
       <div><div class="eyebrow">JOINT CONTROL</div><h2>关节控制</h2></div>
@@ -51,7 +57,12 @@ document.querySelector("#app").innerHTML = `
         <input id="robot-speed-slider" type="range" aria-label="全局速度滑条（rad/s）" min="0.01" step="0.01">
         <div class="number-wrap"><input id="robot-speed" type="number" min="0.01" step="0.01" value="0.2"></div>
       </div>
-      <div class="actions"><button id="send-robot-position" type="button" disabled>发送位置</button><button id="reset-robot" type="button" disabled>全部复位</button><button id="return-to-simulation" type="button" hidden>返回仿真</button></div>
+      <div class="actions">
+        <button id="send-robot-position" type="button" disabled>发送位置</button>
+        <button id="pause-robot-position" type="button" disabled>暂停</button>
+        <button id="reset-robot" type="button" disabled>全部复位</button>
+        <button id="return-to-simulation" type="button" hidden>返回仿真</button>
+      </div>
       <p id="target-preview-key" hidden>蓝色半透明模型为待发送目标</p>
       <p id="robot-motion-status" role="status" hidden></p>
     </section>
@@ -64,6 +75,7 @@ document.querySelector("#app").innerHTML = `
     <div id="simulation-actions" class="actions"><button id="reset" disabled>↺　全部复位</button></div>
     <div id="simulation-info" class="info"><span class="info-icon">◎</span><div><strong>在虚拟空间，自由探索。</strong><p>自碰撞物理阻挡 · 关节限位保护<br>仅控制虚拟机械臂</p></div></div>
     </section><section class="sidebar-panel" id="motor-monitor" role="tabpanel" aria-labelledby="monitor-tab" hidden></section>
+    ${sdkPanel}
     <div class="panel-bottom"><span>Panthera HT</span><span>6 DOF <b>·</b> V1.1.0</span></div>
   </aside></main>`;
 
@@ -88,6 +100,7 @@ let robotGripperTarget;
 let gripperEdited = false;
 let gripperHasCommand = false;
 let sendingPosition = false;
+let pausingPosition = false;
 let requestedMode;
 let positionCommandId;
 
@@ -103,13 +116,16 @@ function showRobotStatus({ state, message }) {
   robotConnection.dataset.state = state;
   const text = message || robotStatusLabels[state];
   if (robotStatus.textContent !== text) robotStatus.textContent = text;
-  robotButton.disabled = ["connecting", "disconnecting", "homing"].includes(state);
+  robotButton.disabled = Boolean(sdk?.locked()) || ["connecting", "disconnecting", "homing"].includes(state);
   const buttonText = ["connected", "disconnecting", "homing"].includes(state)
     ? "断开真机"
     : "连接真机";
   if (robotButton.textContent !== buttonText) robotButton.textContent = buttonText;
   if (state === "error") telemetry?.markDisconnected();
-  if (state === "error" || state === "disconnected") requestedMode = undefined;
+  if (state === "error" || state === "disconnected") {
+    requestedMode = undefined;
+    sdk?.updateHardware(null, true);
+  }
   if (stateChanged) updateMotionControls();
 }
 
@@ -153,6 +169,7 @@ async function refreshRobotStatus(method = "GET", initial = false) {
 }
 
 robotButton.onclick = () => {
+  sdk?.clearPreview();
   clearTimeout(robotStatusTimer);
   const connected = robotConnection.dataset.state === "connected";
   showRobotStatus({ state: connected ? "disconnecting" : "connecting" });
@@ -163,6 +180,7 @@ const simulation = new Simulation();
 let viewer;
 let telemetry;
 let ready = false;
+let sdk;
 const controls = [];
 const labels = [
   "基座旋转",
@@ -178,6 +196,7 @@ const robotModeButtons = [...motionPanel.querySelectorAll("[data-mode]")];
 const speedInput = document.querySelector("#robot-speed");
 const speedSlider = document.querySelector("#robot-speed-slider");
 const sendPosition = document.querySelector("#send-robot-position");
+const pausePosition = document.querySelector("#pause-robot-position");
 const resetRobot = document.querySelector("#reset-robot");
 const motionStatus = document.querySelector("#robot-motion-status");
 const returnToSimulation = document.querySelector("#return-to-simulation");
@@ -191,6 +210,7 @@ const gripperActual = document.querySelector("#gripper-opening");
 const tcpButton = document.querySelector("#tcp-drag");
 const tcpFeedback = document.querySelector("#tcp-feedback");
 const tcpDistance = document.querySelector("#tcp-distance");
+let previewPath;
 let tcpEnabled = false;
 let tcpGoal;
 let tcpQueuedGoal;
@@ -265,10 +285,20 @@ function receiveRobotPose(status) {
   const mode = status.mode ?? "position";
   const modeChanged = (robotPose?.mode ?? "position") !== mode;
   const pendingChanged = robotPose?.pendingMode !== status.pendingMode;
+  const positionPhaseChanged = robotPose?.positionPhase !== status.positionPhase;
+  const positionStatus = status.positionStatus;
+  const positionCompleted = positionStatus?.completed && (
+    !robotPose?.positionStatus?.completed || robotPose.positionStatus.commandId !== positionStatus.commandId
+  );
   const modeRejected = status.modeMessage && status.modeMessage !== robotPose?.modeMessage;
   robotPose = status;
+  if (newSession) sdk?.updateHardware(null, true);
+  sdk?.updateHardware(status.action);
+  if (newSession || modeChanged || positionCompleted || status.positionPhase === "settling") {
+    pausingPosition = false;
+  }
   if (newSession || mode === requestedMode || modeRejected) requestedMode = undefined;
-  if (newSession || modeChanged) {
+  if (newSession || modeChanged || positionCompleted) {
     if (tcpEnabled) setTcpEnabled(false);
     positionCommandId = undefined;
     const holdTargets = status.motors.slice(0, labels.length).map((motor) => motor.target);
@@ -280,7 +310,7 @@ function receiveRobotPose(status) {
     gripperHasCommand = mode === "position" && Number.isFinite(gripperTarget);
     robotGripperTarget = gripperHasCommand ? gripperTarget : status.gripper;
     sendingPosition = false;
-    showMotionMessage("");
+    showMotionMessage(positionCompleted ? positionStatus.message : "");
     if (newSession) {
       speedInput.max = speedSlider.max = status.maxSpeed;
       speedInput.value = speedSlider.value = Math.min(0.2, status.maxSpeed);
@@ -306,11 +336,12 @@ function receiveRobotPose(status) {
   }
   if (ready) {
     simulation.setRobotPose(status.positions, status.gripper);
-    if ((pendingChanged || modeRejected) && !newSession && !modeChanged) updateMotionControls();
+    if (positionPhaseChanged && status.positionPhase === "settling") showMotionMessage("");
+    if ((pendingChanged || positionPhaseChanged || modeRejected)
+        && !newSession && !modeChanged && !positionCompleted) updateMotionControls();
     updateTargetPreview();
     if (modeRejected) showMotionMessage(status.modeMessage);
-    const positionStatus = status.positionStatus;
-    if (positionStatus && positionStatus.commandId === positionCommandId) {
+    if (!pausingPosition && positionStatus && positionStatus.commandId === positionCommandId) {
       showMotionMessage(positionStatus.message);
     }
     telemetry.update({
@@ -327,9 +358,11 @@ function receiveRobotPose(status) {
 }
 
 function updateTargetPreview() {
+  if (previewPath) return;
   const show = Boolean(
     robotPose && robotConnection.dataset.state === "connected"
     && (robotPose.mode ?? "position") === "position" && !requestedMode && !robotPose.pendingMode
+    && !robotPose.positionPhase && !pausingPosition
     && (editedRobotJoints.size || gripperEdited),
   );
   previewKey.hidden = !show;
@@ -349,44 +382,57 @@ function updateMotionControls() {
   const state = robotConnection.dataset.state;
   const live = state === "connected" && Boolean(robotPose);
   const realView = Boolean(robotPose);
+  const sdkLocked = sdk?.locked();
   viewer.setRobotView(realView);
   const mode = robotPose?.mode ?? "position";
+  const positionActionsAvailable = robotPose?.positionPhase !== undefined;
   const switchingTo = requestedMode || robotPose?.pendingMode;
   const switching = Boolean(switchingTo);
-  const positionReady = live && !switching && mode === "position" && !sendingPosition;
-  const tcpAvailable = realView ? live && !switching && mode === "position" : state !== "connecting";
-  tcpButton.disabled = !tcpAvailable;
+  const settling = pausingPosition || robotPose?.positionPhase === "settling";
+  const awaitingPositionStatus = positionCommandId > (robotPose?.positionStatus?.commandId ?? 0);
+  const moving = !settling && (robotPose?.positionPhase === "moving" || awaitingPositionStatus);
+  const positionBusy = settling || moving;
+  const positionReady = live && positionActionsAvailable && !switching
+    && mode === "position" && !sendingPosition && !positionBusy && !sdkLocked;
+  const tcpAvailable = realView
+    ? live && positionActionsAvailable && !switching && !positionBusy && !sdkLocked && mode === "position"
+    : state !== "connecting" && !sdkLocked;
+  tcpButton.disabled = !tcpAvailable || sendingPosition;
   if (!tcpAvailable && tcpEnabled) setTcpEnabled(false);
   viewer.tcpInteractive = tcpEnabled && !sendingPosition;
   document.querySelector(".mode").lastChild.textContent = realView ? " 真机视图" : " 本地仿真";
   document.querySelector("#joint-intro").textContent = realView
     ? (state === "homing" ? "正在回零，到位后自动断开。"
       : state === "error" ? "真机连接中断。"
+      : settling ? "正在停稳，随后保持当前位置…"
+      : moving ? "位置运动中，到位后保持目标角度。"
       : switchingTo === "impedance" ? "等待关节稳定后切入阻抗…"
       : switching ? "正在切换控制模式…"
+      : mode === "position" && !positionActionsAvailable ? "请重启真机桥接服务以启用位置控制。"
       : modeDescriptions[mode])
     : "调整目标角度，探索机械臂的运动。";
   const returningToSimulation = !realView && !motionPanel.hidden;
   motionPanel.hidden = !realView;
   for (const button of robotModeButtons) {
-    button.disabled = !live || switching || sendingPosition;
+    button.disabled = !live || switching || sendingPosition || positionBusy || Boolean(sdkLocked);
     button.setAttribute("aria-pressed", String(button.dataset.mode === mode));
   }
   gripperSection.hidden = realView && !robotPose.gripperLimits;
   gripperSlider.disabled = gripperInput.disabled = gripperClose.disabled = gripperOpen.disabled =
-    realView && !positionReady;
+    Boolean(sdkLocked) || (realView && !positionReady);
   document.querySelector("#simulation-actions").hidden = realView;
   document.querySelector("#simulation-info").hidden = realView;
   returnToSimulation.hidden = !realView || state !== "error";
   sendPosition.disabled = !positionReady || !(editedRobotJoints.size || gripperEdited)
     || (tcpEnabled && !tcpReachable);
+  pausePosition.disabled = !live || !positionActionsAvailable || !moving || mode !== "position" || Boolean(sdkLocked);
   resetRobot.disabled = !positionReady ||
     robotPose.limits.some(([lower, upper]) => lower > 0 || upper < 0) ||
     Boolean(robotPose.gripperLimits &&
       (robotPose.gripperLimits[0] > 0 || robotPose.gripperLimits[1] < 0));
   speedInput.disabled = speedSlider.disabled = !positionReady;
   controls.forEach((control, index) => {
-    control.setDisabled(realView && !positionReady);
+    control.setDisabled(Boolean(sdkLocked) || (realView && !positionReady));
     if (returningToSimulation) {
       const { min, max } = simulation.joints[index];
       control.setLimits(min, max);
@@ -398,7 +444,60 @@ function updateMotionControls() {
     displayGripperTarget(simulation.gripperTarget);
     telemetry.update(simulation.getMotorTelemetry(), simulation.paused);
   }
+  robotButton.disabled = Boolean(sdkLocked) || ["connecting", "disconnecting", "homing"].includes(state);
+  document.querySelector("#reset").disabled = Boolean(sdkLocked);
+  sdk?.refresh();
   updateTargetPreview();
+}
+
+function sdkContext() {
+  if (!ready) return null;
+  const state = robotConnection.dataset.state;
+  if (robotPose) {
+    if (state !== "connected") return null;
+    return {
+      real: true, simulation, session: robotPose.session,
+      pose: { positions: robotPose.positions, gripper: robotPose.gripper },
+      limits: robotPose.limits, gripperLimits: robotPose.gripperLimits, maxSpeed: robotPose.maxSpeed,
+      canRun: robotPose.action !== undefined && robotPose.mode === "position" && !robotPose.pendingMode
+        && !requestedMode && !sendingPosition && !robotPose.positionPhase
+        && !(positionCommandId > (robotPose.positionStatus?.commandId ?? 0)),
+    };
+  }
+  if (state === "connecting") return null;
+  return {
+    real: false, simulation, pose: simulation.getActionPose(), maxSpeed: 1,
+    limits: simulation.joints.map(({ min, max }) => [min, max]), gripperLimits: [0, 2], canRun: true,
+  };
+}
+
+function previewSdkAction(point, start, points, context) {
+  if (!point) {
+    previewPath = undefined;
+    viewer.showActionPath(null);
+    updateTargetPreview();
+    return;
+  }
+  if (previewPath !== points) {
+    previewPath = points;
+    const stride = Math.max(1, Math.ceil(points.length / 400));
+    viewer.showActionPath(points.filter((_, index) => index % stride === 0 || index === points.length - 1)
+      .map((pose) => simulation.actionTcp(pose.positions, Boolean(context.gripperLimits)).position));
+  }
+  const actual = simulation.setActionPreviewStart(start);
+  viewer.setTargetPreview(simulation.setTargetPreview(point.positions, point.gripper), actual);
+}
+
+async function postSdkAction(path, payload) {
+  const response = await fetch("/api/panthera/actions" + path, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
+    signal: AbortSignal.timeout(5000),
+  });
+  const result = await response.json();
+  if (!response.ok) throw new Error(result.message || "真机动作请求失败");
+  return result;
 }
 
 for (const button of robotModeButtons) {
@@ -493,7 +592,9 @@ sendPosition.onclick = async () => {
     });
     const result = await response.json();
     if (!response.ok) throw new Error(result.message);
-    if (robotPose?.session !== session) return;
+    if (robotPose?.session !== session || robotPose.mode !== "position"
+        || pausingPosition || robotPose.positionPhase === "settling"
+        || (robotPose.positionStatus?.completed && robotPose.positionStatus.commandId >= result.commandId)) return;
     if (positions) robotHasCommand = true;
     if (gripper !== undefined) gripperHasCommand = true;
     positionCommandId = result.commandId;
@@ -501,12 +602,38 @@ sendPosition.onclick = async () => {
     gripperEdited = false;
     showMotionMessage(result.message);
   } catch (error) {
-    if (robotPose?.session === session) showMotionMessage(error.message || "发送失败");
+    if (robotPose?.session === session && robotPose.mode === "position" && !pausingPosition) {
+      showMotionMessage(error.message || "发送失败");
+    }
   } finally {
     if (robotPose?.session === session) {
       sendingPosition = false;
       updateMotionControls();
     }
+  }
+};
+
+pausePosition.onclick = async () => {
+  if (pausePosition.disabled) return;
+  const { session, positionStatus } = robotPose;
+  const commandId = Math.max(positionStatus?.commandId ?? 0, positionCommandId ?? 0);
+  pausingPosition = true;
+  showMotionMessage("");
+  updateMotionControls();
+  try {
+    const response = await fetch("/api/panthera/position/pause", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ session, commandId }),
+      signal: AbortSignal.timeout(5000),
+    });
+    const result = await response.json();
+    if (!response.ok) throw new Error(result.message);
+  } catch (error) {
+    if (robotPose?.session !== session || !pausingPosition) return;
+    pausingPosition = false;
+    showMotionMessage(error.message || "暂停请求失败");
+    updateMotionControls();
   }
 };
 
@@ -698,6 +825,7 @@ window.addEventListener("blur", () => viewer?.endJointInteraction());
 const tabs = [...document.querySelectorAll('.sidebar-tabs [role="tab"]')];
 function selectPanel(tab) {
   if (tab.disabled) return;
+  if (tab.id !== "sdk-tab") sdk?.clearPreview();
   for (const item of tabs) {
     const selected = item === tab;
     item.setAttribute("aria-selected", String(selected));
@@ -760,9 +888,21 @@ try {
   );
   telemetry.update(simulation.getMotorTelemetry(), simulation.paused);
   document.querySelector("#monitor-tab").disabled = false;
+  document.querySelector("#sdk-tab").disabled = false;
   document.querySelector("#loading").hidden = true;
   document.querySelector("#reset").disabled = false;
   ready = true;
+  sdk = createSdkPanel({
+    context: sdkContext,
+    changed: updateMotionControls,
+    preview: previewSdkAction,
+    run: (payload) => postSdkAction("", payload),
+    stop: (id) => postSdkAction("/stop", { id, session: robotPose?.session }),
+    syncSimulation: () => {
+      controls.forEach((control, i) => control.display(simulation.targets[i]));
+      displayGripperTarget(simulation.gripperTarget);
+    },
+  });
   showRobotStatus({ state: "disconnected" });
   updateMotionControls();
   void refreshRobotStatus("GET", true);
@@ -781,7 +921,10 @@ function frame(now) {
   requestAnimationFrame(frame);
   if (ready) {
     if (tcpQueuedGoal) applyTcpGoal();
-    if (!robotPose) simulation.advance(document.hidden ? 0 : (now - previous) / 1000);
+    if (!robotPose) {
+      sdk?.tick(simulation);
+      simulation.advance(document.hidden ? 0 : (now - previous) / 1000);
+    }
     if (tcpEnabled) renderTcpFeedback(robotPose ? simulation.robotData : simulation.data);
     if (now - lastUI > 100) {
       if (robotPose && Number.isFinite(robotPose.gripper)) {

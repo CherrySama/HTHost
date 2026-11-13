@@ -372,6 +372,33 @@ export class Viewer {
     this.dirty = true;
   }
 
+  showActionPath(points) {
+    if (!points?.length) {
+      if (this.actionPath?.visible) {
+        this.actionPath.visible = false;
+        this.dirty = true;
+      }
+      return;
+    }
+    if (!this.actionPath) {
+      const geometry = new THREE.BufferGeometry();
+      geometry.setAttribute("position", new THREE.Float32BufferAttribute(512 * 3, 3));
+      this.actionPath = new THREE.Line(geometry, new THREE.LineBasicMaterial({
+        ...markerMaterial, color: "#007b86", opacity: 0.9,
+      }));
+      this.actionPath.renderOrder = 8;
+      this.scene.add(this.actionPath);
+    }
+    const attribute = this.actionPath.geometry.getAttribute("position");
+    for (let i = 0; i < attribute.count; i++) {
+      const point = points[Math.round(i * (points.length - 1) / (attribute.count - 1))];
+      attribute.setXYZ(i, ...point);
+    }
+    attribute.needsUpdate = true;
+    this.actionPath.visible = true;
+    this.dirty = true;
+  }
+
   setOverlayVisible(name, visible) {
     let group = this.overlays.get(name);
     if (!group && visible) {

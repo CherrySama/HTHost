@@ -1,8 +1,9 @@
 import loadMujoco from "@mujoco/mujoco";
 import wasmUrl from "@mujoco/mujoco/mujoco.wasm?url";
 import sceneUrl from "../models/panthera.xml?url";
-import { gripperOpening } from "./gripper-calibration.js";
-import { solveTcpPosition } from "./tcp-ik.js";
+import { GRIPPER_CALIBRATION, gripperOpening } from "./gripper-calibration.js";
+import { solveTcpPose, solveTcpPosition } from "./tcp-ik.js";
+import { Quaternion } from "three";
 
 const assets = import.meta.glob(
   "../Panthera-HT_SDK/panthera_python/Panthera-HT_description_V1.1.0/mujoco/meshes/obj/*.obj",
@@ -170,9 +171,68 @@ export class Simulation {
     return this.previewData;
   }
 
+  setActionPreviewStart(pose) {
+    this.actionPreviewStart ??= new this.mj.MjData(this.model);
+    this.writePose(this.actionPreviewStart, pose.positions, pose.gripper);
+    this.mj.mj_kinematics(this.model, this.actionPreviewStart);
+    return this.actionPreviewStart;
+  }
+
   getTcpPosition(data, hasGripper = true) {
     const offset = this.tcpBodies[Number(hasGripper)] * 3;
     return Array.from(data.xpos.subarray(offset, offset + 3));
+  }
+
+  getActionPose() {
+    const opening = this.getGripperState().opening;
+    const index = GRIPPER_CALIBRATION.findIndex(([, width]) => width >= opening);
+    let gripper = index === -1 ? GRIPPER_CALIBRATION.at(-1)[0] : 0;
+    if (index > 0) {
+      const [angle, width] = GRIPPER_CALIBRATION[index];
+      const [lower, lowerWidth] = GRIPPER_CALIBRATION[index - 1];
+      gripper = lower + (angle - lower) * (opening - lowerWidth) / (width - lowerWidth);
+    }
+    return { positions: this.joints.map(({ q }) => this.data.qpos[q]), gripper };
+  }
+
+  actionPoseSettled(goal) {
+    const current = this.getActionPose();
+    return this.joints.every(({ v }, i) => Math.abs(current.positions[i] - goal.positions[i]) <= 0.015
+      && Math.abs(this.data.qvel[v]) <= 0.035)
+      && (goal.gripper == null || (Math.abs(gripperOpening(current.gripper) - gripperOpening(goal.gripper)) <= 1
+        && this.gripperJoints.every(({ v }) => Math.abs(this.data.qvel[v]) <= 0.005)));
+  }
+
+  actionTcp(angles, hasGripper) {
+    this.ikData ??= new this.mj.MjData(this.model);
+    const data = this.ikData;
+    this.writePose(data, angles);
+    this.mj.mj_kinematics(this.model, data);
+    const index = this.tcpBodies[Number(hasGripper)] * 4;
+    const [w, x, y, z] = data.xquat.subarray(index, index + 4);
+    return { position: this.getTcpPosition(data, hasGripper), rotation: new Quaternion(x, y, z, w) };
+  }
+
+  solveActionTcp(goal, seed, limits, hasGripper) {
+    const rotationWeight = 0.25;
+    return solveTcpPose((angles) => {
+      const { position, rotation } = this.actionTcp(angles, hasGripper);
+      const data = this.ikData;
+      const delta = goal.rotation.clone().multiply(rotation.invert());
+      if (delta.w < 0) delta.set(-delta.x, -delta.y, -delta.z, -delta.w);
+      const length = Math.hypot(delta.x, delta.y, delta.z);
+      const scale = rotationWeight * (length < 1e-9 ? 2 : 2 * Math.atan2(length, delta.w) / length);
+      const error = [...goal.position.map((value, i) => value - position[i]),
+        delta.x * scale, delta.y * scale, delta.z * scale];
+      const columns = this.joints.map(({ id }) => {
+        const offset = id * 3;
+        const [x, y, z] = position.map((value, i) => value - data.xanchor[offset + i]);
+        const [ax, ay, az] = data.xaxis.subarray(offset, offset + 3);
+        return [ay * z - az * y, az * x - ax * z, ax * y - ay * x,
+          ax * rotationWeight, ay * rotationWeight, az * rotationWeight];
+      });
+      return { error, columns };
+    }, seed, limits);
   }
 
   solveTcp(target, initial, limits, hasGripper) {

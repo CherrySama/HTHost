@@ -79,3 +79,49 @@ export function solveTcpPosition(evaluate, initial, limits, goal) {
   }
   return distance <= POSITION_TOLERANCE ? angles : null;
 }
+
+// Solve the six-dimensional damped normal equations with pivoting.
+function poseStep(columns, error) {
+  const matrix = error.map((value, i) => [
+    ...error.map((_, j) => columns.reduce((sum, col) => sum + col[i] * col[j], i === j ? DAMPING ** 2 : 0)),
+    value,
+  ]);
+  for (let i = 0; i < error.length; i++) {
+    let pivot = i;
+    for (let j = i + 1; j < error.length; j++) {
+      if (Math.abs(matrix[j][i]) > Math.abs(matrix[pivot][i])) pivot = j;
+    }
+    [matrix[i], matrix[pivot]] = [matrix[pivot], matrix[i]];
+    const divisor = matrix[i][i];
+    matrix[i] = matrix[i].map((value) => value / divisor);
+    matrix.forEach((row, j) => {
+      if (i === j) return;
+      const factor = row[i];
+      matrix[j] = row.map((value, k) => value - factor * matrix[i][k]);
+    });
+  }
+  return columns.map((column) => column.reduce((sum, value, i) => sum + value * matrix[i].at(-1), 0));
+}
+
+export function solveTcpPose(evaluate, seed, limits) {
+  let angles = seed.slice();
+  let pose = evaluate(angles);
+  for (let i = 0; i < 45; i++) {
+    if (Math.hypot(...pose.error.slice(0, 3)) <= 0.0015
+        && Math.hypot(...pose.error.slice(3)) <= 0.003) return angles;
+    const step = poseStep(pose.columns, pose.error);
+    const distance = Math.hypot(...pose.error);
+    let improved = false;
+    for (let scale = Math.min(1, MAX_JOINT_STEP / Math.max(...step.map(Math.abs))); scale >= 0.015; scale /= 2) {
+      const candidate = angles.map((angle, j) => Math.max(limits[j][0], Math.min(limits[j][1], angle + scale * step[j])));
+      const next = evaluate(candidate);
+      if (Math.hypot(...next.error) >= distance) continue;
+      angles = candidate;
+      pose = next;
+      improved = true;
+      break;
+    }
+    if (!improved) break;
+  }
+  return null;
+}
