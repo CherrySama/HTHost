@@ -193,6 +193,10 @@ export class PantheraSerial {
     try {
       ports = (await serial.getPorts()).filter(isPantheraPort);
       if (!ports.length) {
+        this.onStatus({
+          state: "connecting",
+          message: "请选择 Livelybot Communication Board，网页会自动识别控制接口",
+        });
         const selected = await serial.requestPort({ filters: [USB_FILTER] });
         // Chrome may authorize several interfaces together. Probe the selected one first.
         const authorized = await serial.getPorts().catch(() => []);
@@ -205,7 +209,9 @@ export class PantheraSerial {
     }
 
     let failure;
-    for (const port of ports) {
+    for (const [index, port] of ports.entries()) {
+      const progress = ports.length > 1 ? `（${index + 1}/${ports.length}）` : "";
+      this.onStatus({ state: "connecting", message: `正在识别控制接口${progress}…` });
       const result = await this.probe(port);
       if (result.state === "connected") return;
       failure ??= result;

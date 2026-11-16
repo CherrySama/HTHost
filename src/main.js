@@ -188,7 +188,7 @@ async function refreshRobotStatus(method = "GET", initial = false) {
 function receiveSerialStatus(status) {
   if (status.state === "connected") {
     receiveRobotPose(status);
-  } else {
+  } else if (status.state === "error" || status.state === "disconnected") {
     serialConnection = undefined;
     if (status.state === "disconnected") robotPose = undefined;
   }
