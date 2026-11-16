@@ -187,6 +187,7 @@ export class MotorTelemetry {
     const zeroPausesSampling = live && !this.disconnected &&
       ["queued", "writing"].includes(this.calibration?.phase);
     this.overview.hidden = !live;
+    this.calibrationPanel.hidden = Boolean(this.latest.readOnly);
     this.drive.hidden = !live;
     if (live) {
       this.drive.textContent = "驱动模式 " + (joint.driveMode ?? "—");
@@ -214,7 +215,7 @@ export class MotorTelemetry {
     }
     this.renderCalibration();
     this.root.querySelector(".data-source").textContent = zeroPausesSampling
-      ? "采样暂停" : live ? "真机数据" : "仿真数据";
+      ? "采样暂停" : this.latest.readOnly ? "USB 只读" : live ? "真机数据" : "仿真数据";
     this.root.querySelector("#monitor-clock").textContent = live ? "连接时长" : "仿真时间";
     this.root.querySelector(".monitor-note").textContent = live
       ? "力矩来自电机反馈。位置误差 = 已下发目标 − 实际角度。"

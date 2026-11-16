@@ -4,9 +4,10 @@ import { Viewer } from "./viewer.js";
 import { MotorTelemetry } from "./motor-telemetry.js";
 import { gripperOpening } from "./gripper-calibration.js";
 import { createSdkPanel, sdkPanel } from "./sdk-panel.js";
+import { PantheraSerial } from "./panthera-serial.js";
 
 document.querySelector("#app").innerHTML = `
-  <header><a class="brand" href="/" aria-label="Panthera Studio 首页"><span class="brand-icon">P</span>Panthera <span>Studio</span></a>
+  <header><a class="brand" href="./" aria-label="Panthera Studio 首页"><span class="brand-icon">P</span>Panthera <span>Studio</span></a>
     <span class="mode"><i></i> 本地仿真</span>
     <div class="robot-connection" data-state="disconnected">
       <button id="robot-connect" type="button" disabled>连接真机</button>
@@ -94,6 +95,9 @@ const robotStatusLabels = {
 let robotStatusTimer;
 let robotRequest = 0;
 let robotPose;
+let serialConnection;
+let bridgeAvailable = false;
+let bridgeChecking = false;
 let robotTargets = [];
 const editedRobotJoints = new Set();
 let robotHasCommand = false;
@@ -117,7 +121,7 @@ function showRobotStatus({ state, message, calibration }) {
   robotConnection.dataset.state = state;
   const text = message || robotStatusLabels[state];
   if (robotStatus.textContent !== text) robotStatus.textContent = text;
-  robotButton.disabled = Boolean(sdk?.locked() || sdk?.recordingNow())
+  robotButton.disabled = bridgeChecking || Boolean(sdk?.locked() || sdk?.recordingNow())
     || ["connecting", "disconnecting", "homing", "calibrating"].includes(state);
   const buttonText = ["connected", "disconnecting", "homing", "calibrating"].includes(state)
     ? "断开真机"
@@ -154,6 +158,8 @@ async function refreshRobotStatus(method = "GET", initial = false) {
       return;
     }
     if (!response.ok) throw new Error("连接服务不可用");
+    if (!Object.hasOwn(robotStatusLabels, status.state)) throw new Error("连接服务响应无效");
+    bridgeAvailable = true;
     if (["connected", "homing", "calibrating"].includes(status.state)) receiveRobotPose(status);
     if (status.state === "disconnected" && robotPose) {
       robotPose = undefined;
@@ -171,7 +177,22 @@ async function refreshRobotStatus(method = "GET", initial = false) {
         message: returning ? "回零未确认：无法访问真机连接服务" : "无法访问真机连接服务",
       });
     }
+  } finally {
+    if (initial && request === robotRequest) {
+      bridgeChecking = false;
+      updateMotionControls();
+    }
   }
+}
+
+function receiveSerialStatus(status) {
+  if (status.state === "connected") {
+    receiveRobotPose(status);
+  } else {
+    serialConnection = undefined;
+    if (status.state === "disconnected") robotPose = undefined;
+  }
+  showRobotStatus(status);
 }
 
 robotButton.onclick = () => {
@@ -180,6 +201,15 @@ robotButton.onclick = () => {
   clearTimeout(robotStatusTimer);
   const connected = robotConnection.dataset.state === "connected";
   showRobotStatus({ state: connected ? "disconnecting" : "connecting" });
+  if (serialConnection) {
+    void serialConnection.close();
+    return;
+  }
+  if (!bridgeAvailable) {
+    serialConnection = new PantheraSerial(receiveSerialStatus);
+    void serialConnection.connect();
+    return;
+  }
   void refreshRobotStatus(connected ? "DELETE" : "POST");
 };
 
@@ -362,6 +392,7 @@ function receiveRobotPose(status) {
     }
     telemetry.update({
       source: "robot",
+      readOnly: status.readOnly,
       session: status.session,
       time: status.sampleTime,
       joints: status.motors.map((motor, index) => ({
@@ -399,6 +430,7 @@ function updateMotionControls() {
   const state = robotConnection.dataset.state;
   const live = state === "connected" && Boolean(robotPose);
   const realView = Boolean(robotPose);
+  const readOnly = Boolean(robotPose?.readOnly);
   const sdkLocked = sdk?.locked();
   const sdkRecording = sdk?.recordingNow();
   viewer.setRobotView(realView);
@@ -422,6 +454,7 @@ function updateMotionControls() {
   document.querySelector("#joint-intro").textContent = realView
     ? (state === "homing" ? "正在回零，到位后自动断开。"
       : state === "error" ? "真机连接中断。"
+      : readOnly ? "USB 直连只读模式，可查看真机姿态和电机反馈。"
       : state === "calibrating" ? "正在校准零位，请保持机械臂姿态。"
       : settling ? "正在停稳，随后保持当前位置…"
       : moving ? "位置运动中，到位后保持目标角度。"
@@ -433,7 +466,7 @@ function updateMotionControls() {
   const returningToSimulation = !realView && !motionPanel.hidden;
   motionPanel.hidden = !realView;
   for (const button of robotModeButtons) {
-    button.disabled = !live || switching || sendingPosition || positionBusy || Boolean(sdkLocked || sdkRecording);
+    button.disabled = readOnly || !live || switching || sendingPosition || positionBusy || Boolean(sdkLocked || sdkRecording);
     button.setAttribute("aria-pressed", String(button.dataset.mode === mode));
   }
   gripperSection.hidden = realView && !robotPose.gripperLimits;
@@ -463,7 +496,7 @@ function updateMotionControls() {
     displayGripperTarget(simulation.gripperTarget);
     telemetry.update(simulation.getMotorTelemetry(), simulation.paused);
   }
-  robotButton.disabled = Boolean(sdkLocked || sdkRecording)
+  robotButton.disabled = bridgeChecking || Boolean(sdkLocked || sdkRecording)
     || ["connecting", "disconnecting", "homing", "calibrating"].includes(state);
   document.querySelector("#reset").disabled = Boolean(sdkLocked || sdkRecording);
   sdk?.refresh();
@@ -474,7 +507,7 @@ function sdkContext() {
   if (!ready) return null;
   const state = robotConnection.dataset.state;
   if (robotPose) {
-    if (state !== "connected") return null;
+    if (state !== "connected" || robotPose.readOnly) return null;
     const recordingSupported = robotPose.recording !== undefined;
     return {
       real: true, simulation, session: robotPose.session,
@@ -950,9 +983,10 @@ try {
       displayGripperTarget(simulation.gripperTarget);
     },
   });
+  bridgeChecking = ["127.0.0.1", "localhost", "[::1]"].includes(location.hostname);
   showRobotStatus({ state: "disconnected" });
   updateMotionControls();
-  void refreshRobotStatus("GET", true);
+  if (bridgeChecking) void refreshRobotStatus("GET", true);
   // Diagnostic access for browser verification.
   window.panthera = { simulation, viewer, telemetry };
 } catch (error) {
@@ -990,7 +1024,8 @@ function frame(now) {
       const robotState = robotConnection.dataset.state;
       document.querySelector("#status").textContent = robotPose
         ? (robotState === "homing" ? "回零中 · 真机姿态同步"
-          : robotState === "connected" ? "真机姿态同步中" : "保留最后一次真机姿态")
+          : robotState === "connected" ? (robotPose.readOnly ? "USB 只读 · 真机姿态同步中" : "真机姿态同步中")
+          : "保留最后一次真机姿态")
         : simulation.paused
         ? "仿真已暂停"
         : simulation.getSelfContacts().length
