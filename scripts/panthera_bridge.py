@@ -3,26 +3,43 @@
 import json
 import math
 import multiprocessing
-import os
 import signal
-import subprocess
-import sys
 import time
-import uuid
+from contextlib import contextmanager
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from pathlib import Path
 from threading import Lock, Thread
 
 if __package__:
-    from .sdk_actions import (ActionRun, MAX_NATIVE_FRAMES, NATIVE_WIDTH, TrajectoryRecording,
-                              native_target, prepare_native_trajectory, validate_plan)
+    from .panthera_control import (
+        ARM_JOINTS, ControlCommand, CONTROL_INTERVAL, CONTROL_LEASE, CONTROL_MODES, FEEDBACK_TIMEOUT,
+        GRIPPER_MAX_SPEED, MOTOR_POSITION_MODE, MOTOR_SLOTS, MOVE_POSITION, NATIVE_MODES,
+        PAUSE_COMMANDS, PAUSE_POSITION, POINT_PAUSE, POINT_POSITION, POSITION_ACTIONS,
+        POSITION_RESPONSE_SECONDS, POSITION_SETTLE_SPEED, POSITION_TOLERANCE, RETURN_SPEED, RobotSession,
+        SDK, SDK_REPLAY, SDK_SINE, STARTUP_TIMEOUT, STREAM_POSITION,
+        SharedStateTimeout, WRITE_ZERO, ZERO_QUEUED, ZERO_STILL_SECONDS, ZERO_TOLERANCE,
+        ZERO_UNVERIFIED, ZERO_VERIFYING, ZERO_WRITE_TIMEOUT, ZERO_WRITING, motor_name,
+        run_sdk_worker
+    )
+    from .sdk_actions import (ActionRun, TrajectoryRecording,
+                              prepare_native_trajectory, validate_plan)
 else:
-    from sdk_actions import (ActionRun, MAX_NATIVE_FRAMES, NATIVE_WIDTH, TrajectoryRecording,
-                             native_target, prepare_native_trajectory, validate_plan)
+    from panthera_control import (
+        ARM_JOINTS, ControlCommand, CONTROL_INTERVAL, CONTROL_LEASE, CONTROL_MODES, FEEDBACK_TIMEOUT,
+        GRIPPER_MAX_SPEED, MOTOR_POSITION_MODE, MOTOR_SLOTS, MOVE_POSITION, NATIVE_MODES,
+        PAUSE_COMMANDS, PAUSE_POSITION, POINT_PAUSE, POINT_POSITION, POSITION_ACTIONS,
+        POSITION_RESPONSE_SECONDS, POSITION_SETTLE_SPEED, POSITION_TOLERANCE, RETURN_SPEED, RobotSession,
+        SDK, SDK_REPLAY, SDK_SINE, STARTUP_TIMEOUT, STREAM_POSITION,
+        SharedStateTimeout, WRITE_ZERO, ZERO_QUEUED, ZERO_STILL_SECONDS, ZERO_TOLERANCE,
+        ZERO_UNVERIFIED, ZERO_VERIFYING, ZERO_WRITE_TIMEOUT, ZERO_WRITING, motor_name,
+        run_sdk_worker
+    )
+    from sdk_actions import (ActionRun, TrajectoryRecording,
+                             prepare_native_trajectory, validate_plan)
 
 
-SDK = Path(__file__).resolve().parents[1] / "Panthera-HT_SDK" / "panthera_python"
 ENDPOINT = "/api/panthera/connection"
+PAGE_ENDPOINT = "/api/panthera/connection/page"
+PAGE_CLOSE_DELAY = 3
 POSITION_ENDPOINT = "/api/panthera/position"
 PAUSE_POSITION_ENDPOINT = "/api/panthera/position/pause"
 MODE_ENDPOINT = "/api/panthera/mode"
@@ -32,541 +49,56 @@ STOP_ACTION_ENDPOINT = "/api/panthera/actions/stop"
 ESTIMATE_ACTION_ENDPOINT = "/api/panthera/actions/estimate"
 START_RECORDING_ENDPOINT = "/api/panthera/actions/record/start"
 STOP_RECORDING_ENDPOINT = "/api/panthera/actions/record/stop"
-STARTUP_TIMEOUT = 15
-FEEDBACK_TIMEOUT = 2
-CONTROL_INTERVAL = 0.04
-CONTROL_LEASE = 5
-ARM_JOINTS = 6
-MOTOR_SLOTS = ARM_JOINTS + 1
-GRIPPER_MAX_SPEED = 0.3
-GRIPPER_MAX_TORQUE = 0.15
-SDK_SINE_INTERVAL = 0.002
-SDK_REPLAY_INTERVAL = 0.01
-SDK_REPLAY_KP = (30.0, 40.0, 55.0, 15.0, 7.0, 5.0)
-SDK_REPLAY_KD = (3.0, 4.0, 5.5, 1.5, 0.7, 0.5)
-SDK_REPLAY_TORQUE = (15.0, 30.0, 30.0, 15.0, 5.0, 5.0)
-RETURN_SPEED = 0.2
-RETURN_SETTLE_SAMPLES = 3
-RETURN_SETTLE_SPEED = 0.03
-POSITION, GRAVITY, GRAVITY_FRICTION, IMPEDANCE = range(4)
-CONTROL_MODES = ("position", "gravity", "gravity_friction", "impedance")
-# Position commands can move, stop in place, or hold when explicitly selecting the mode.
-MOVE_POSITION, PAUSE_POSITION, STREAM_POSITION, SDK_SINE, SDK_REPLAY = range(len(CONTROL_MODES), len(CONTROL_MODES) + 5)
-NATIVE_MODES = (SDK_SINE, SDK_REPLAY)
-WRITE_ZERO = SDK_REPLAY + 1
-ZERO_TOLERANCE = 0.01
-ZERO_STILL_SECONDS = 0.3
-ZERO_WRITE_TIMEOUT = 30
-ZERO_VERIFY_TIMEOUT = 3
-ZERO_QUEUED, ZERO_WRITING, ZERO_VERIFYING, ZERO_DONE, ZERO_REJECTED, ZERO_UNVERIFIED = range(1, 7)
-POSITION_ACTIONS = (MOVE_POSITION, PAUSE_POSITION)
-POSITION_TOLERANCE = 0.01
-POSITION_SETTLE_SPEED = 0.03
-POSITION_SETTLE_SECONDS = 0.15
-TORQUE_INTERVAL = 0.005
-TORQUE_FEEDBACK_TIMEOUT = 0.15
-CONTROL_WATCHDOG_MS = 250
-MODE_TRANSITION_SECONDS = 0.25
-IMPEDANCE_TRANSITION_SECONDS = 0.5
-IMPEDANCE_SETTLE_SPEED = 0.06
-IMPEDANCE_SETTLE_SECONDS = 0.15
-IMPEDANCE_WAIT_SECONDS = 3
-MOTOR_POSITION_MODE = 10
-POSITION_RESPONSE_SECONDS = 0.6
-TORQUE_LIMITS = (10.0, 10.0, 10.0, 10.0, 10.0, 3.7)
-FRICTION_COULOMB = (0.10, 0.12, 0.12, 0.08, 0.03, 0.02)
-FRICTION_VISCOUS = (0.04, 0.06, 0.06, 0.04, 0.02, 0.02)
-IMPEDANCE_STIFFNESS = (4.0, 10.0, 10.0, 2.0, 2.0, 1.0)
-IMPEDANCE_DAMPING = (0.5, 0.8, 0.8, 0.2, 0.2, 0.1)
-
-
-class RobotSession:
-    def __init__(self, context):
-        self.id = uuid.uuid4().hex
-        self.stop = context.Event()
-        self.returned = context.Event()
-        self.feedback = context.Array("d", 6 + 6 * MOTOR_SLOTS)
-        self.limits = context.Array("d", 2 * ARM_JOINTS + 3)
-        self.command = context.Array("d", [0, POSITION, 0, 0, math.nan, 0, *([0] * ARM_JOINTS)])
-        self.trajectory = context.RawArray("d", MAX_NATIVE_FRAMES * NATIVE_WIDTH)
-        self.last_status_request = context.Value("d", 0, lock=False)
-        self.zero = context.Array("d", [0, 0, *([math.nan] * MOTOR_SLOTS)])
-
-
-class TorqueControl:
-    def __init__(self, robot, mode, positions, now, previous=None):
-        self.robot = robot
-        self.mode = mode
-        self.started = now
-        self.target = positions[:ARM_JOINTS] if mode == IMPEDANCE else None
-        self.previous_torque = previous.torque if previous else None
-        self.torque = None
-        self.zero = [0.0] * ARM_JOINTS
-        self.limits = [min(limit, rated) for limit, rated in zip(TORQUE_LIMITS, robot.max_torque)]
-        self.gripper_position = positions[-1]
-        self.gripper_gain = 0.0
-        self.previous_gripper_gain = previous.gripper_gain if previous else 0.0
-        if previous and previous.mode == IMPEDANCE and mode != IMPEDANCE:
-            self.gripper_position = previous.gripper_position
-
-    def send(self, positions, velocities, now):
-        arm = positions[:ARM_JOINTS]
-        velocity = velocities[:ARM_JOINTS]
-        gravity = list(self.robot.get_Gravity(arm))
-        if len(gravity) != ARM_JOINTS or not all(math.isfinite(value) for value in gravity):
-            raise RuntimeError("动力学计算返回了无效重力力矩")
-        torque = gravity
-        if self.mode == GRAVITY_FRICTION:
-            friction = self.robot.get_friction_compensation(
-                velocity, FRICTION_COULOMB, FRICTION_VISCOUS, 0.02
-            )
-            torque = [g + f for g, f in zip(gravity, friction)]
-        elif self.mode == IMPEDANCE:
-            torque = [
-                g + k * (target - position) - b * speed
-                for g, k, b, target, position, speed in zip(
-                    gravity, IMPEDANCE_STIFFNESS, IMPEDANCE_DAMPING, self.target, arm, velocity
-                )
-            ]
-
-        if len(torque) != ARM_JOINTS or not all(math.isfinite(value) for value in torque):
-            raise RuntimeError("动力学计算返回了无效力矩")
-        duration = IMPEDANCE_TRANSITION_SECONDS if self.mode == IMPEDANCE else MODE_TRANSITION_SECONDS
-        progress = min(1.0, (now - self.started) / duration)
-        blend = progress * progress * (3 - 2 * progress)
-        previous = self.previous_torque if self.previous_torque is not None else gravity
-        self.torque = [
-            max(-limit, min(limit, start + blend * (value - start)))
-            for start, value, limit in zip(previous, torque, self.limits)
-        ]
-
-        if self.robot.has_gripper:
-            gain = self.previous_gripper_gain + blend * (
-                float(self.mode == IMPEDANCE) - self.previous_gripper_gain
-            )
-            self.gripper_gain = gain
-            gripper_position = self.gripper_position if gain else 0.0
-            if not self.robot.gripper_control_MIT(
-                gripper_position, 0.0, 0.0, 0.65 * gain, 0.06 * gain, send=False
-            ):
-                raise RuntimeError("SDK 拒绝了夹爪力矩指令")
-        if not self.robot.pos_vel_tqe_kp_kd(self.zero, self.zero, self.torque, self.zero, self.zero):
-            raise RuntimeError("SDK 拒绝了关节力矩指令")
-        return progress >= 1.0
-
-
-def send_sdk_target(robot, mode, target, measured):
-    positions, velocities, gripper, gripper_velocity, _ = target
-    if mode == SDK_SINE:
-        # The sine step inherits the gripper target reached during approach.
-        if not robot.Joint_Pos_Vel(positions, velocities, iswait=False):
-            raise RuntimeError("SDK 拒绝了正弦轨迹目标")
-        return
-
-    gravity = robot.get_Gravity(measured[:ARM_JOINTS])
-    if len(gravity) != ARM_JOINTS or not all(math.isfinite(value) for value in gravity):
-        raise RuntimeError("动力学计算返回了无效重力力矩")
-    torques = [max(-limit, min(limit, value)) for value, limit in
-               zip(gravity, map(min, SDK_REPLAY_TORQUE, robot.max_torque))]
-    if robot.has_gripper:
-        if math.isfinite(gripper):
-            gripper_command = (gripper, gripper_velocity, 0, 5.0, 0.5)
-        else:
-            gripper_command = (0, 0, 0, 0, 0)
-        if not robot.gripper_control_MIT(*gripper_command, send=False):
-            raise RuntimeError("SDK 拒绝了夹爪回放目标")
-    if not robot.pos_vel_tqe_kp_kd(positions, velocities, torques, SDK_REPLAY_KP, SDK_REPLAY_KD):
-        raise RuntimeError("SDK 拒绝了关节回放目标")
-
-
-def external_serial_owners(ports):
-    # fuser also matches aliases of the same character device.
-    try:
-        result = subprocess.run(["fuser", *map(str, ports)], capture_output=True,
-                                text=True, timeout=2, check=False)
-    except (OSError, subprocess.TimeoutExpired) as exc:
-        raise RuntimeError("无法检查机械臂串口占用，请确认系统的 fuser 可用") from exc
-    if result.returncode == 1 and not result.stdout.strip() and not result.stderr.strip():
-        return []
-    owners = result.stdout.split()
-    if result.returncode != 0 or not owners or not all(pid.isdecimal() for pid in owners):
-        raise RuntimeError("无法确认机械臂串口占用状态")
-    return sorted({int(pid) for pid in owners} - {os.getpid()})
-
-
-def monitor_robot(session, errors):
-    stop = session.stop
-    try:
-        ports = sorted(port for port in Path("/dev").glob("ttyACM*") if port.is_char_device())
-        if not ports:
-            raise RuntimeError("未找到机械臂 USB 控制板")
-        owners = external_serial_owners(ports)
-        if owners:
-            raise RuntimeError("机械臂串口已被其他程序占用，请退出 SDK 脚本后重连（PID "
-                               + "、".join(map(str, owners)) + "）")
-
-        sys.path.insert(0, str(SDK / "scripts"))
-        from Panthera_lib.Panthera import Panthera
-
-        robot = Panthera(str(SDK / "robot_param" / "Follower.yaml"))
-        motors = robot.Motors
-        expected_count = ARM_JOINTS + int(robot.gripper_installed)
-        if len(motors) != expected_count:
-            raise RuntimeError("电机数量与从臂配置不匹配")
-        motor_ids = [motor.get_motor_id() for motor in motors]
-        gripper_limits = [math.nan, math.nan]
-        if robot.has_gripper and robot.gripper_limits:
-            lower = max(0, robot.gripper_limits["lower"])
-            upper = min(2, robot.gripper_limits["upper"])
-            if lower < upper:
-                gripper_limits = [lower, upper]
-        session.limits[:] = [
-            *robot.joint_limits["lower"],
-            *robot.joint_limits["upper"],
-            min(robot.velocity_limits),
-            *gripper_limits,
-        ]
-
-        pending = {motor.get_motor_id(): motor for motor in motors}
-        timestamps = {
-            motor_id: motor.get_current_motor_state().time
-            for motor_id, motor in pending.items()
-        }
-        readings = {}
-        applied_targets = [math.nan] * MOTOR_SLOTS
-        applied_command_id = 0
-        applied_at = 0
-        command_id = 0
-        tracking_position = False
-        position_settled_since = None
-        completed_position_id = 0
-        rejected_mode_id = 0
-        waiting_impedance_id = 0
-        impedance_wait_started = 0
-        settled_since = None
-        target = None
-        speeds = None
-        gripper_target = math.nan
-        gripper_speed = 0
-        return_deadline = 0
-        settled_samples = 0
-        torque_control = None
-        confirmed_mode = POSITION
-        watchdog_ready = False
-        handoff_until = 0
-        handoff_positions = None
-        handoff_gripper = math.nan
-        native_mode = None
-        native_index = 0
-        native_started = 0
-        still_since = None
-        zero_verify_deadline = 0
-        zero_samples = 0
-        position_tolerance = float(robot.config.get("control", {}).get("position_tolerance", 0.01))
-        last_complete = time.monotonic()
-        parent = multiprocessing.parent_process()
-        while not stop.is_set() and parent.is_alive():
-            robot.send_get_motor_state_cmd()
-            robot.motor_send_cmd()
-            interval = (SDK_SINE_INTERVAL if native_mode == SDK_SINE else
-                        SDK_REPLAY_INTERVAL if native_mode == SDK_REPLAY else
-                        TORQUE_INTERVAL if torque_control else CONTROL_INTERVAL)
-            if stop.wait(interval):
-                break
-
-            for motor_id, motor in list(pending.items()):
-                state = motor.get_current_motor_state()
-                timestamp = state.time
-                values = (state.position, state.velocity, state.torque)
-                if (
-                    state.ID == motor_id
-                    and timestamp > 0
-                    and timestamp != timestamps[motor_id]
-                    and all(math.isfinite(value) and abs(value) < 998 for value in values)
-                ):
-                    timestamps[motor_id] = timestamp
-                    readings[motor_id] = (*values, state.mode, state.fault)
-                    del pending[motor_id]
-
-            now = time.monotonic()
-            if return_deadline and now >= return_deadline:
-                raise RuntimeError("等待到位超时")
-            if not pending:
-                last_complete = now
-                measured = [readings[motor_id] for motor_id in motor_ids]
-                if not robot.gripper_installed:
-                    measured.append((math.nan, math.nan, math.nan, 0, 0))
-                positions, velocities, torques, motor_modes, motor_faults = zip(*measured)
-                still = all(abs(value) <= POSITION_SETTLE_SPEED for value in velocities[:len(motors)])
-                still_since = (now if still_since is None else still_since) if still else None
-                session.zero[1] = still_since if still_since is not None else 0
-                session.feedback[:] = [
-                    now, confirmed_mode, rejected_mode_id, applied_command_id, applied_at, completed_position_id,
-                    *positions, *velocities, *torques, *applied_targets, *motor_modes, *motor_faults,
-                ]
-                pending = {motor.get_motor_id(): motor for motor in motors}
-                if zero_verify_deadline:
-                    at_zero = [abs(value) <= ZERO_TOLERANCE for value in positions[:len(motors)]]
-                    healthy = not any(motor_faults)
-                    zero_samples = zero_samples + 1 if all(at_zero) and still and healthy else 0
-                    phase = ZERO_VERIFYING
-                    if zero_samples >= 3:
-                        phase = ZERO_DONE
-                    elif not healthy or now >= zero_verify_deadline:
-                        phase = ZERO_UNVERIFIED
-                    session.zero[:] = [phase, session.zero[1], *positions]
-                    if phase != ZERO_VERIFYING:
-                        zero_verify_deadline = 0
-                    continue
-                next_id, mode, speed, next_gripper_speed, next_gripper, deadline, *next_target = session.command[:]
-                accept_command = next_id != command_id
-                if accept_command and mode == WRITE_ZERO:
-                    command_id = next_id
-                    if (confirmed_mode != POSITION or torque_control or native_mode or any(motor_faults)
-                            or still_since is None or now - still_since < ZERO_STILL_SECONDS
-                            or any(abs(actual - expected) > ZERO_TOLERANCE
-                                   for actual, expected in zip(positions[:ARM_JOINTS], next_target))
-                            or (robot.gripper_installed and abs(positions[-1] - next_gripper) > ZERO_TOLERANCE)):
-                        session.zero[0] = ZERO_REJECTED
-                        continue
-                    if stop.is_set() or now - session.last_status_request.value > CONTROL_LEASE:
-                        session.zero[0] = ZERO_REJECTED
-                        continue
-                    target = None
-                    gripper_target = math.nan
-                    applied_targets = [math.nan] * MOTOR_SLOTS
-                    tracking_position = False
-                    session.zero[0] = ZERO_WRITING
-                    robot.set_reset_zero()
-                    robot.motor_send_cmd()
-                    # A pre-write packet cannot verify a new zero.
-                    timestamps = {motor_id: motor.get_current_motor_state().time
-                                  for motor_id, motor in pending.items()}
-                    last_complete = time.monotonic()
-                    zero_verify_deadline = last_complete + ZERO_VERIFY_TIMEOUT
-                    zero_samples = 0
-                    still_since = None
-                    session.zero[:] = [ZERO_VERIFYING, 0, *([math.nan] * MOTOR_SLOTS)]
-                    continue
-                if accept_command and mode == IMPEDANCE:
-                    if waiting_impedance_id != next_id:
-                        waiting_impedance_id = next_id
-                        impedance_wait_started = now
-                        settled_since = None
-                    if all(abs(velocity) <= IMPEDANCE_SETTLE_SPEED for velocity in velocities[:len(motors)]):
-                        if settled_since is None:
-                            settled_since = now
-                    else:
-                        settled_since = None
-                    accept_command = settled_since is not None and now - settled_since >= IMPEDANCE_SETTLE_SECONDS
-                    if not accept_command and now - impedance_wait_started >= IMPEDANCE_WAIT_SECONDS:
-                        rejected_mode_id = command_id = next_id
-
-                if accept_command:
-                    command_id = next_id
-                    native_mode = mode if mode in NATIVE_MODES else None
-                    return_deadline = deadline
-                    settled_samples = 0
-                    tracking_position = mode in POSITION_ACTIONS
-                    position_settled_since = None
-                    if native_mode:
-                        native_index = 0
-                        native_started = now
-                        target = None
-                        gripper_target = math.nan
-                    elif mode == PAUSE_POSITION:
-                        target = [
-                            max(lower, min(upper, position))
-                            for position, lower, upper in zip(
-                                positions, robot.joint_limits["lower"], robot.joint_limits["upper"]
-                            )
-                        ]
-                        hold_speed = min(RETURN_SPEED, min(robot.velocity_limits))
-                        speeds = [hold_speed] * ARM_JOINTS
-                        gripper_target = (
-                            max(gripper_limits[0], min(gripper_limits[1], positions[-1]))
-                            if math.isfinite(gripper_limits[0]) else math.nan
-                        )
-                        gripper_speed = min(hold_speed, GRIPPER_MAX_SPEED)
-                    elif mode not in (POSITION, MOVE_POSITION, STREAM_POSITION):
-                        torque_control = TorqueControl(robot, mode, positions, now, torque_control)
-                        target = None
-                        gripper_target = math.nan
-                    elif torque_control:
-                        handoff_positions = positions[:ARM_JOINTS]
-                        if any(
-                            not lower <= position <= upper
-                            for position, lower, upper in zip(
-                                handoff_positions, robot.joint_limits["lower"], robot.joint_limits["upper"]
-                            )
-                        ):
-                            raise RuntimeError("实测姿态超出关节限位，无法切回位置控制")
-                        handoff_gripper = math.nan
-                        if robot.has_gripper and robot.gripper_limits:
-                            if robot.gripper_limits["lower"] <= positions[-1] <= robot.gripper_limits["upper"]:
-                                handoff_gripper = positions[-1]
-                        hold_speed = min(RETURN_SPEED, min(robot.velocity_limits))
-                        target = next_target if deadline else handoff_positions
-                        speeds = [speed if deadline else hold_speed] * ARM_JOINTS
-                        gripper_target = next_gripper if deadline else handoff_gripper
-                        gripper_speed = next_gripper_speed if deadline else min(hold_speed, GRIPPER_MAX_SPEED)
-                        handoff_until = now + MODE_TRANSITION_SECONDS if deadline else 0
-                        torque_control = None
-                    else:
-                        if speed:
-                            target = next_target
-                            speeds = [speed] * ARM_JOINTS
-                        if next_gripper_speed:
-                            gripper_target = next_gripper
-                            gripper_speed = next_gripper_speed
-
-                if (
-                    tracking_position
-                    and applied_command_id == command_id
-                    and completed_position_id != command_id
-                ):
-                    stopped = all(abs(value) <= POSITION_SETTLE_SPEED for value in velocities[:len(motors)])
-                    reached = all(
-                        not math.isfinite(goal) or abs(position - goal) <= POSITION_TOLERANCE
-                        for position, goal in zip(positions, applied_targets)
-                    )
-                    if not stopped or not reached:
-                        position_settled_since = None
-                    elif position_settled_since is None:
-                        position_settled_since = now
-                    elif now - position_settled_since >= POSITION_SETTLE_SECONDS:
-                        completed_position_id = command_id
-
-                handoff = now < handoff_until
-                arm_command = handoff_positions if handoff else target
-                gripper_command = handoff_gripper if handoff else gripper_target
-                has_gripper_target = math.isfinite(gripper_command)
-                if (native_mode or torque_control or arm_command is not None or has_gripper_target) and not stop.is_set():
-                    fault_message = describe_motor_faults(motor_faults)
-                    if fault_message:
-                        raise RuntimeError(fault_message)
-                    if not watchdog_ready:
-                        timeout = robot.motor_timeout_ms
-                        robot.set_timeout(min(timeout, CONTROL_WATCHDOG_MS) if timeout > 0 else CONTROL_WATCHDOG_MS)
-                        watchdog_ready = True
-
-                if native_mode and not stop.is_set():
-                    if now - session.last_status_request.value > CONTROL_LEASE:
-                        raise RuntimeError("控制页面已失联，SDK 轨迹已结束")
-                    with session.command.get_lock():
-                        if session.command[0] != next_id:
-                            continue
-                        frame = native_target(native_mode == SDK_SINE, session.trajectory,
-                                              int(next_target[0]), speed, now - native_started, native_index)
-                        send_sdk_target(robot, native_mode, frame, positions)
-                    native_index = frame[-1]
-                    applied_targets[:ARM_JOINTS] = frame[0]
-                    applied_targets[-1] = frame[2]
-                    if applied_command_id != command_id:
-                        applied_command_id = command_id
-                        applied_at = now
-                    continue
-
-                if torque_control and not stop.is_set():
-                    if now - session.last_status_request.value > CONTROL_LEASE:
-                        raise RuntimeError("控制页面已失联，力矩控制已结束")
-                    if torque_control.send(positions, velocities, now):
-                        confirmed_mode = torque_control.mode
-                    applied_targets[:ARM_JOINTS] = torque_control.target or [math.nan] * ARM_JOINTS
-                    applied_targets[-1] = (
-                        torque_control.gripper_position
-                        if torque_control.mode == IMPEDANCE and robot.has_gripper else math.nan
-                    )
-                    continue
-
-                if (arm_command is not None or has_gripper_target) and not stop.is_set():
-                    if now - session.last_status_request.value > CONTROL_LEASE:
-                        raise RuntimeError("控制页面已失联，位置控制已结束")
-                    if return_deadline and not handoff:
-                        count = MOTOR_SLOTS if has_gripper_target else ARM_JOINTS
-                        at_zero = all(
-                            abs(position) <= position_tolerance and abs(velocity) <= RETURN_SETTLE_SPEED
-                            for position, velocity in zip(positions[:count], velocities[:count])
-                        )
-                        settled_samples = settled_samples + 1 if at_zero else 0
-                        if settled_samples >= RETURN_SETTLE_SAMPLES:
-                            session.returned.set()
-                            break
-                    # Serialize dispatch with the pause request, so a replaced target cannot be sent later.
-                    with session.command.get_lock():
-                        if session.command[0] != next_id:
-                            continue
-                        if arm_command is not None:
-                            if not robot.Joint_Pos_Vel(arm_command, speeds, iswait=False):
-                                raise RuntimeError("SDK 拒绝了关节目标")
-                            applied_targets[:ARM_JOINTS] = arm_command
-                        if has_gripper_target and not stop.is_set():
-                            if not robot.gripper_control(gripper_command, gripper_speed, GRIPPER_MAX_TORQUE):
-                                raise RuntimeError("SDK 拒绝了夹爪目标")
-                    applied_targets[-1] = gripper_command
-                    confirmed_mode = POSITION
-                    if applied_command_id != command_id and command_id != rejected_mode_id:
-                        applied_command_id = command_id
-                        applied_at = now
-                elif stop.wait(0.06):
-                    break
-            elif zero_verify_deadline and now >= zero_verify_deadline:
-                session.zero[0] = ZERO_UNVERIFIED
-                zero_verify_deadline = 0
-            elif zero_verify_deadline:
-                continue
-            elif now - last_complete > (TORQUE_FEEDBACK_TIMEOUT if torque_control or native_mode else FEEDBACK_TIMEOUT):
-                missing = "、".join(motor.get_motor_name() for motor in pending.values())
-                raise RuntimeError(f"未收到电机反馈（{missing}）")
-    except KeyboardInterrupt:
-        pass
-    except (Exception, SystemExit) as exc:
-        print(f"Panthera: {exc}", file=sys.stderr, flush=True)
-        message = str(exc) if isinstance(exc, RuntimeError) else "Panthera SDK 初始化或读取失败"
-        errors.send(message)
-    finally:
-        errors.close()
 
 
 class RobotConnection:
     def __init__(self):
         self.context = multiprocessing.get_context("spawn")
+        # 仅记录本桥接进程的配置历史，不代表设备超时寄存器已读回或已清除。
+        self.timed_control_started = self.context.RawValue("b", False)
         self.lock = Lock()
         self.worker = None
+        self.session = None
         self.message = ""
         self.return_deadline = 0
         self.zero_deadline = 0
         self.zero_failure = None
         self.action = None
         self.recording = None
+        self.pages = {}
 
     def connect(self):
         with self.lock:
-            self._status()
-            if self.worker is None:
-                self.message = ""
-                self.zero_failure = None
-                self.action = None
-                self.recording = None
-                self.session = RobotSession(self.context)
-                self.errors, child_errors = self.context.Pipe(duplex=False)
-                self.worker = self.context.Process(
-                    target=monitor_robot, args=(self.session, child_errors)
-                )
-                self.started = time.monotonic()
-                try:
-                    self.worker.start()
-                except OSError:
-                    self.worker = None
-                    self.errors.close()
-                    self.message = "无法启动 Panthera SDK 进程"
-                finally:
-                    child_errors.close()
+            status = self._status()
+            if self.worker is not None:
+                return status
+            self.message = ""
+            self.zero_failure = None
+            self.action = None
+            self.recording = None
+            self.pages.clear()
+            self.session = RobotSession(self.context, self.timed_control_started)
+            self.errors, child_errors = self.context.Pipe(duplex=False)
+            self.worker = self.context.Process(
+                target=run_sdk_worker, args=(self.session, child_errors)
+            )
+            self.started = time.monotonic()
+            try:
+                self.worker.start()
+            except OSError:
+                self.worker = None
+                self.session = None
+                self.errors.close()
+                self.message = "无法启动 Panthera SDK 进程"
+            finally:
+                child_errors.close()
             return self._status()
 
     def disconnect(self):
         with self.lock:
-            self._stop_worker()
+            if not self._stop_worker():
+                self.message = "Panthera SDK 进程未能结束"
+                return self._connection_error()
             self.message = ""
             self.zero_failure = None
             return self._status()
@@ -579,7 +111,7 @@ class RobotConnection:
             return status
 
     def write_zero(self, request):
-        with self.lock:
+        with self.lock, self._recover_shared_state():
             status = self._status()
             if status["state"] != "connected" or request.get("session") != status["session"]:
                 return 409, {"message": "真机当前无法写入零位"}
@@ -596,9 +128,11 @@ class RobotConnection:
             self.zero_deadline = now + ZERO_WRITE_TIMEOUT
             session.zero[:] = [ZERO_QUEUED, 0, *([math.nan] * MOTOR_SLOTS)]
             session.last_status_request.value = now
-            session.command[:] = [session.command[0] + 1, WRITE_ZERO, 0, 0,
-                                  expected[-1] if len(expected) == MOTOR_SLOTS else math.nan,
-                                  0, *expected[:ARM_JOINTS]]
+            session.command[:] = ControlCommand(
+                session.command[0] + 1, WRITE_ZERO,
+                gripper=expected[-1] if len(expected) == MOTOR_SLOTS else math.nan,
+                targets=expected[:ARM_JOINTS],
+            ).pack()
             Thread(target=self._watch_zero, args=(session,), daemon=True).start()
             return 202, {"phase": "queued"}
 
@@ -611,7 +145,7 @@ class RobotConnection:
             time.sleep(0.2)
 
     def set_position(self, request):
-        with self.lock:
+        with self.lock, self._recover_shared_state():
             status = self._status()
             if status["state"] != "connected" or request.get("session") != status["session"]:
                 return 409, {"message": "真机连接已失效，请重新连接"}
@@ -631,7 +165,9 @@ class RobotConnection:
                 return 400, {"message": "速度超出真机允许范围"}
 
             command = self.session.command
-            command_id, _, arm_speed, gripper_speed, gripper, _, *positions = command[:]
+            command_id = command[0]
+            positions, arm_speed = [0] * ARM_JOINTS, 0
+            gripper, gripper_speed = math.nan, 0
             if has_arm:
                 positions = request["positions"]
                 if (
@@ -658,11 +194,14 @@ class RobotConnection:
 
             self.session.last_status_request.value = time.monotonic()
             command_id += 1
-            command[:] = [command_id, MOVE_POSITION, arm_speed, gripper_speed, gripper, 0, *positions]
+            command[:] = ControlCommand(
+                command_id, POINT_POSITION, speed=arm_speed, gripper_speed=gripper_speed,
+                gripper=gripper, targets=positions,
+            ).pack()
             return 202, {"message": "位置目标已提交，等待电机反馈", "commandId": int(command_id)}
 
     def pause_position(self, request):
-        with self.lock:
+        with self.lock, self._recover_shared_state():
             status = self._status()
             if status["state"] != "connected" or request.get("session") != status["session"]:
                 return 409, {"message": "真机当前无法暂停"}
@@ -671,11 +210,11 @@ class RobotConnection:
             if status["positionPhase"] != "moving" or request.get("commandId") != status["positionStatus"]["commandId"]:
                 return 409, {"message": "该位置指令已结束或正在停稳"}
             self.session.last_status_request.value = time.monotonic()
-            self._queue_action_pose(PAUSE_POSITION)
+            self._queue_action_pose(POINT_PAUSE)
             return 202, {"message": "已请求暂停，正在停稳"}
 
     def set_mode(self, request):
-        with self.lock:
+        with self.lock, self._recover_shared_state():
             status = self._status()
             if status["state"] != "connected" or request.get("session") != status["session"]:
                 return 409, {"message": "真机当前无法切换控制模式"}
@@ -700,49 +239,86 @@ class RobotConnection:
 
             command = self.session.command
             self.session.last_status_request.value = time.monotonic()
-            command[:] = [
-                command[0] + 1, CONTROL_MODES.index(mode), 0, 0, math.nan, 0,
-                *([0] * ARM_JOINTS),
-            ]
+            command[:] = ControlCommand(command[0] + 1, CONTROL_MODES.index(mode)).pack()
             return 202, {"mode": mode}
 
     def return_and_disconnect(self, request):
-        with self.lock:
-            status = self._status()
-            if request.get("session") != status.get("session"):
-                return 409, {"message": "真机连接已失效，请重新连接"}
-            if status["state"] == "homing":
-                return 202, status
-            if status["state"] != "connected":
-                return 409, {"message": "真机当前无法回零"}
-            if self.action and self.action.active:
-                return 409, {"message": "请先停止 SDK 动作"}
-            if self.recording and self.recording.active:
-                return 409, {"message": "请先停止轨迹录制"}
+        with self.lock, self._recover_shared_state():
+            return self._return_and_disconnect(request)
 
-            limits = status["limits"]
-            gripper_limits = status["gripperLimits"]
-            if any(not lower <= 0 <= upper for lower, upper in limits) or (
-                gripper_limits and not gripper_limits[0] <= 0 <= gripper_limits[1]
-            ):
-                return 409, {"message": "零位超出真机限位"}
-
-            speed = min(RETURN_SPEED, status["maxSpeed"])
-            gripper_target = 0 if gripper_limits else math.nan
-            gripper_speed = min(speed, GRIPPER_MAX_SPEED) if gripper_limits else 0
-            travel_time = max(abs(position) for position in status["positions"]) / speed
-            if gripper_limits:
-                travel_time = max(travel_time, abs(status["gripper"]) / gripper_speed)
-            now = time.monotonic()
-            self.return_deadline = now + max(8, travel_time + 5)
-            command = self.session.command
-            self.session.last_status_request.value = now
-            command[:] = [
-                command[0] + 1, POSITION, speed, gripper_speed, gripper_target,
-                self.return_deadline, *([0] * ARM_JOINTS),
-            ]
-            status["state"] = "homing"
+    def _return_and_disconnect(self, request):
+        status = self._status()
+        if request.get("session") != status.get("session"):
+            return 409, {"message": "真机连接已失效，请重新连接"}
+        if status["state"] == "homing":
             return 202, status
+        if status["state"] != "connected":
+            return 409, {"message": "真机当前无法回零"}
+        if self.action and self.action.active:
+            return 409, {"message": "请先停止 SDK 动作"}
+        if self.recording and self.recording.active:
+            return 409, {"message": "请先停止轨迹录制"}
+
+        limits = status["limits"]
+        gripper_limits = status["gripperLimits"]
+        if any(not lower <= 0 <= upper for lower, upper in limits) or (
+            gripper_limits and not gripper_limits[0] <= 0 <= gripper_limits[1]
+        ):
+            return 409, {"message": "零位超出真机限位"}
+
+        speed = min(RETURN_SPEED, status["maxSpeed"])
+        gripper_target = 0 if gripper_limits else math.nan
+        gripper_speed = min(speed, GRIPPER_MAX_SPEED) if gripper_limits else 0
+        travel_time = max(abs(position) for position in status["positions"]) / speed
+        if gripper_limits:
+            travel_time = max(travel_time, abs(status["gripper"]) / gripper_speed)
+        now = time.monotonic()
+        self.return_deadline = now + max(8, travel_time + 5)
+        command = self.session.command
+        self.session.last_status_request.value = now
+        command[:] = ControlCommand(
+            command[0] + 1, POINT_POSITION, speed=speed, gripper_speed=gripper_speed,
+            gripper=gripper_target, return_deadline=self.return_deadline,
+        ).pack()
+        Thread(target=self._watch_return, args=(self.session,), daemon=True).start()
+        status["state"] = "homing"
+        return 202, status
+
+    def _watch_return(self, session):
+        while True:
+            with self.lock:
+                if self.session is not session or not self.return_deadline:
+                    return
+                self._status()
+            time.sleep(0.2)
+
+    def page_lifecycle(self, request):
+        with self.lock:
+            if self.session is None or request.get("session") != self.session.id:
+                return 409, {"message": "真机连接已失效"}
+            page, stamp, leaving = request.get("page"), request.get("stamp"), request.get("leaving")
+            if (not isinstance(page, str) or not 0 < len(page) <= 100
+                    or not is_finite_number(stamp) or type(leaving) is not bool):
+                return 400, {"message": "无效的页面状态"}
+            previous = self.pages.get(page)
+            if previous is not None and stamp <= previous[0]:
+                return 200, {"message": "已忽略旧页面通知"}
+            self.pages[page] = (stamp, leaving)
+            if leaving:
+                Thread(target=self._return_after_page_close,
+                       args=(self.session, page, stamp), daemon=True).start()
+            return 202, {"message": "页面状态已更新"}
+
+    def _return_after_page_close(self, session, page, stamp):
+        time.sleep(PAGE_CLOSE_DELAY)
+        # Reuse the manual disconnect entry while holding the same connection lock.
+        with self.lock, self._recover_shared_state():
+            if (self.session is not session or self.pages.get(page) != (stamp, True)
+                    or any(not leaving for _, leaving in self.pages.values())):
+                return
+            code, result = self._return_and_disconnect({"session": session.id})
+            if code != 202:
+                print(f"网页关闭后未回零：{result.get('message', '')}", flush=True)
 
     def start_recording(self, request):
         with self.lock:
@@ -784,21 +360,24 @@ class RobotConnection:
         positions, gripper = pose if pose is not None else ([0] * ARM_JOINTS, None)
         command = self.session.command
         command_id = int(command[0]) + 1
-        command[:] = [
-            command_id, mode, speed, min(speed, GRIPPER_MAX_SPEED) if gripper is not None else 0,
-            gripper if gripper is not None else math.nan, 0, *positions,
-        ]
+        command[:] = ControlCommand(
+            command_id, mode, speed=speed,
+            gripper_speed=min(speed, GRIPPER_MAX_SPEED) if gripper is not None else 0,
+            gripper=gripper if gripper is not None else math.nan, targets=positions,
+        ).pack()
         return command_id
 
     def _queue_native_trajectory(self, trajectory):
         command = self.session.command
         mode = SDK_SINE if trajectory.kind == "joint-sine" else SDK_REPLAY
         data = [value for row in trajectory.rows for value in row]
-        with command.get_lock():
+        with command.locked():
             self.session.trajectory[:len(data)] = data
             command_id = int(command[0]) + 1
-            command[:] = [command_id, mode, trajectory.duration, 0, math.nan, 0,
-                          len(trajectory.rows), *([0] * (ARM_JOINTS - 1))]
+            command[:] = ControlCommand(
+                command_id, mode, speed=trajectory.duration,
+                targets=(len(trajectory.rows), *([0] * (ARM_JOINTS - 1))),
+            ).pack()
         return command_id
 
     @staticmethod
@@ -811,7 +390,7 @@ class RobotConnection:
         return prepare_native_trajectory(kind, points, speed, gripper_speed, status, TrajectoryRecorder)
 
     def start_action(self, request):
-        with self.lock:
+        with self.lock, self._recover_shared_state():
             status = self._status()
             if status["state"] != "connected" or request.get("session") != status["session"]:
                 return 409, {"message": "真机连接已失效"}
@@ -843,7 +422,7 @@ class RobotConnection:
         return 200, {"seconds": loops * sum(times[-1] + dwell for _, dwell, times, _, _ in segments)}
 
     def stop_action(self, request):
-        with self.lock:
+        with self.lock, self._recover_shared_state():
             status = self._status()
             run = self.action
             if (status["state"] != "connected" or request.get("session") != status["session"]
@@ -880,7 +459,11 @@ class RobotConnection:
                     run.message = status.get("message", "真机连接已结束")
                     return
                 now = time.monotonic()
-                self._tick_action(run, status, now)
+                try:
+                    self._tick_action(run, status, now)
+                except SharedStateTimeout as exc:
+                    self._fail_worker(str(exc))
+                    return
             time.sleep(CONTROL_INTERVAL)
 
     def _tick_action(self, run, status, now):
@@ -923,25 +506,50 @@ class RobotConnection:
             self._approach_action(run, status, now)
 
     def _status(self):
-        if self.worker is not None:
-            if self.session.returned.is_set():
-                self._stop_worker()
+        try:
+            return self._read_status()
+        except SharedStateTimeout as exc:
+            return self._fail_worker(str(exc))
+
+    @contextmanager
+    def _recover_shared_state(self):
+        try:
+            yield
+        except SharedStateTimeout as exc:
+            status = self._fail_worker(str(exc))
+            raise SharedStateTimeout(status["message"]) from exc
+
+    def _poll_worker_exit(self):
+        """处理工作进程退出；调用方持有连接锁，返回终态或 None。"""
+        if self.message:
+            self._stop_worker()
+            return self._connection_error()
+        if self.session.returned.value:
+            if self._stop_worker():
                 return {"state": "disconnected"}
-            if self.errors.poll():
-                try:
-                    self.message = self.errors.recv()
-                except EOFError:
-                    self.message = "Panthera SDK 进程已退出"
-            elif not self.worker.is_alive():
-                self.message = "Panthera SDK 进程已退出"
+            self.message = "已回零，但 Panthera SDK 进程未能结束"
+            return self._connection_error()
+        if self.errors.poll():
+            try:
+                message = self.errors.recv()
+            except (EOFError, OSError):
+                message = "Panthera SDK 进程已退出"
+            return self._fail_worker(message)
+        elif not self.worker.is_alive():
+            return self._fail_worker("Panthera SDK 进程已退出")
+        return None
+
+    def _read_status(self):
+        if self.worker is not None:
+            terminal = self._poll_worker_exit()
+            if terminal is not None:
+                return terminal
 
             now = time.monotonic()
             zero_phase, still_since, *zero_positions = self.session.zero[:]
             zero_active = zero_phase in (ZERO_QUEUED, ZERO_WRITING, ZERO_VERIFYING)
             if zero_active and now >= self.zero_deadline:
                 self.message = "零位写入或反馈验证超时，请核对电机零位后再控制"
-            elif zero_active and self.message:
-                self.message = "零位结果未确认：" + self.message
             elif zero_phase == ZERO_UNVERIFIED:
                 self.message = "零位反馈未通过验证，请核对各电机零位后再控制"
             elif not zero_active:
@@ -958,12 +566,12 @@ class RobotConnection:
                     return {"state": "connecting"}
                 else:
                     mode = CONTROL_MODES[int(confirmed_mode)]
-                    request_id, requested_code = self.session.command[:2]
+                    request_id, requested_code, arm_speed, gripper_speed = self.session.command[:4]
                     position_phase = None
                     if requested_code in (*POSITION_ACTIONS, STREAM_POSITION, WRITE_ZERO, *NATIVE_MODES):
                         requested_mode = "position"
                         if requested_code in POSITION_ACTIONS and request_id != completed_id:
-                            position_phase = "settling" if requested_code == PAUSE_POSITION else "moving"
+                            position_phase = "settling" if requested_code in PAUSE_COMMANDS else "moving"
                     else:
                         requested_mode = CONTROL_MODES[int(requested_code)]
                     rejected = request_id != 0 and request_id == rejected_id
@@ -989,8 +597,15 @@ class RobotConnection:
                     ]
                     position_status = None
                     if position_phase == "moving":
+                        command_motors = motors
+                        if requested_code == POINT_POSITION:
+                            command_motors = [
+                                motor if (arm_speed if index < ARM_JOINTS else gripper_speed)
+                                else {**motor, "target": None}
+                                for index, motor in enumerate(motors)
+                            ]
                         position_status = (
-                            describe_position_status(motors, applied_id, last_feedback - applied_at)
+                            describe_position_status(command_motors, applied_id, last_feedback - applied_at)
                             if applied_id == request_id else
                             {"commandId": int(request_id), "message": "位置目标已提交，等待电机反馈"}
                         )
@@ -998,7 +613,7 @@ class RobotConnection:
                         position_status = {
                             "commandId": int(request_id),
                             "completed": True,
-                            "message": "已暂停，保持当前位置" if requested_code == PAUSE_POSITION
+                            "message": "已暂停，保持当前位置" if requested_code in PAUSE_COMMANDS
                             else "已到达目标，保持当前位置",
                         }
                     pending_mode = requested_mode if requested_mode != mode and not rejected else None
@@ -1035,54 +650,61 @@ class RobotConnection:
                         "maxSpeed": max_speed,
                         "gripperLimits": [gripper_min, gripper_max] if math.isfinite(gripper_min) else None,
                     }
-            if self.return_deadline:
-                self.message = f"回零未完成：{self.message}"
             if zero_active or zero_phase == ZERO_UNVERIFIED:
-                self.zero_deadline = 0
-                self.zero_failure = {
-                    "phase": "unverified",
-                    "positions": [value if math.isfinite(value) else None for value in zero_positions],
-                    "tolerance": ZERO_TOLERANCE,
-                }
-            self._stop_worker()
+                return self._fail_worker(self.message, zero_positions)
+            return self._fail_worker(self.message)
 
         if self.message:
-            return {"state": "error", "message": self.message, "calibration": self.zero_failure}
+            return self._connection_error()
         return {"state": "disconnected"}
+
+    def _connection_error(self):
+        return {"state": "error", "message": self.message, "calibration": self.zero_failure}
+
+    def _fail_worker(self, message, zero_positions=None):
+        if self.return_deadline:
+            message = f"回零未完成：{message}"
+        if self.zero_deadline or zero_positions is not None:
+            message = f"零位结果未确认：{message}"
+            self.zero_failure = {
+                "phase": "unverified",
+                "positions": [value if math.isfinite(value) else None for value in (zero_positions or [])],
+                "tolerance": ZERO_TOLERANCE,
+            }
+        self.message = message
+        self._stop_worker()
+        return self._connection_error()
 
     def _stop_worker(self):
         if self.recording:
             self.recording.active = False
         if self.worker is None:
-            return
-        self.session.stop.set()
-        self.worker.join(timeout=1)
+            return True
+        if self.action and self.action.active:
+            self.action.phase = "error"
+            self.action.message = self.message or "真机连接已结束"
+        if self.worker.is_alive():
+            self.session.stop.set()
+            self.worker.join(timeout=1)
         if self.worker.is_alive():
             self.worker.terminate()
             self.worker.join(timeout=1)
         if self.worker.is_alive():
             self.worker.kill()
-            self.worker.join()
+            self.worker.join(timeout=1)
+        if self.worker.is_alive():
+            return False
         self.worker.close()
         self.errors.close()
         self.worker = None
+        self.session = None
         self.return_deadline = 0
-        if self.action and self.action.active:
-            self.action.phase = "error"
-            self.action.message = self.message or "真机连接已结束"
+        self.zero_deadline = 0
+        return True
 
 
 def is_finite_number(value):
     return type(value) in (int, float) and -math.inf < value < math.inf
-
-
-def motor_name(index):
-    return f"J{index + 1}" if index < ARM_JOINTS else "夹爪"
-
-
-def describe_motor_faults(faults):
-    faults = [f"{motor_name(i)}（故障码 {int(code)}）" for i, code in enumerate(faults) if code]
-    return f"电机报告故障：{'、'.join(faults)}" if faults else None
 
 
 def describe_position_status(motors, command_id, elapsed):
@@ -1114,7 +736,9 @@ class Handler(BaseHTTPRequestHandler):
         self.respond(self.server.robot.status)
 
     def do_POST(self):
-        if self.path == POSITION_ENDPOINT:
+        if self.path == PAGE_ENDPOINT:
+            self.respond_with_request(self.server.robot.page_lifecycle)
+        elif self.path == POSITION_ENDPOINT:
             self.respond_with_request(self.server.robot.set_position)
         elif self.path == PAUSE_POSITION_ENDPOINT:
             self.respond_with_request(self.server.robot.pause_position)
@@ -1165,7 +789,11 @@ class Handler(BaseHTTPRequestHandler):
         except (ValueError, OSError):
             self.send_json(400, {"message": "无效的真机控制请求"})
             return
-        self.send_json(*action(request))
+        try:
+            result = action(request)
+        except SharedStateTimeout as exc:
+            result = 409, {"message": str(exc)}
+        self.send_json(*result)
 
     def send_json(self, status, payload):
         body = json.dumps(payload, ensure_ascii=False).encode()

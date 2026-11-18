@@ -1,6 +1,6 @@
 # Panthera Studio
 
-独立运行的 Panthera HT 六轴机械臂网页仿真。MuJoCo WebAssembly 在浏览器内执行物理计算，Three.js 根据 MuJoCo 的几何体世界坐标绘制模型。采用浅色工作区与简洁的关节控制面板。
+Panthera HT 六轴机械臂网页仿真与本地真机控制界面。MuJoCo WebAssembly 在浏览器内执行物理计算，Three.js 根据 MuJoCo 的几何体世界坐标绘制模型。采用浅色工作区与简洁的关节控制面板。
 
 ## 启动
 
@@ -13,6 +13,16 @@ npm run dev
 ```
 
 打开终端显示的地址，默认是 http://localhost:5173 。模型和 WASM 由本地服务提供，运行时不需要访问 CDN，也不需要 Python、ROS 或真机。
+
+## 真机连接与部署边界
+
+本地真机入口使用 `bash scripts/start_host.sh` 启动网页与 Python SDK 桥接，需要本机 Panthera Python 环境。网页通过 `/api/panthera` 访问桥接；桥接管理 SDK 子进程，工作进程负责反馈和控制。
+
+GitHub Pages 只部署静态网页，不运行 Python 桥接。该入口使用独立的 Web Serial 路径，目前运动控制保持只读限制；本地桥接的回零、重连修复不等于 Web Serial 已验证。仅浏览器显示 `localhost` 也不足以判断实际路径，本地桥接不可用时可能选择串口路径。
+
+本地桥接在网页关闭通知后协调回零；USB 物理断开时无法再发回零命令。普通位置目标只发送一次；补偿和阻抗模式持续发送力矩，但不再额外配置 250 ms 设备超时，与官方示例的配置方式一致。回零仍持续发送至到位。SDK 轨迹／流式位置路径仍保留设备超时设置，因此执行过这些路径、旧版 Host 或其他超时配置程序后，设备可能继续保留超时；本次修改不清除既有配置，也未验证这种情况下拔线保持。
+
+以下“操作”和“模型及边界”主要描述仿真行为，不代表真机物理保障。
 
 ## 操作
 
@@ -39,7 +49,7 @@ Host 为左右夹指启用对称直线关节和物理控制，启用非相邻连
 
 Host 默认显示 SDK 中可选的 D405 腕部相机及安装支架，按源 URDF 的 `camera_joint` 固定连接到 `link6`。相机随腕部运动，保留资产定义的 0.08 kg 质量和惯性，并参与物理碰撞；SDK 中原本被注释的相机定义保持原样。
 
-当前未提供相机 RGB/深度图像、抓取任务、真机控制或路径避障规划。碰撞几何是近似分片，MuJoCo 接触也是软约束，此页面不能用于验证真机运动安全。模型生成方式与排除关系见 [models/README.md](models/README.md)。SDK 目前作为模型资产依赖，尚未调用硬件接口。
+仿真当前未提供相机 RGB/深度图像、抓取任务或路径避障规划。碰撞几何是近似分片，MuJoCo 接触也是软约束，此页面不能用于验证真机运动安全。模型生成方式与排除关系见 [models/README.md](models/README.md)。真机路径另外通过本地 SDK 桥接或浏览器串口接入。
 
 首次加载需读取约 64 MB 网格及 11 MB WASM，加载期间显示进度。静止时按需重绘，移动时更新姿态；高精度原始网格在低性能设备或软件渲染环境下可能较慢。
 
@@ -53,11 +63,23 @@ npm test
 
 生产预览默认使用 http://localhost:4173 。自动化测试使用本机 `/usr/bin/google-chrome`，其他安装路径可通过 `CHROME_PATH` 指定。测试覆盖六个关节独立跟随、目标限幅、复位、网格开关、移动端水平布局，以及 J4 折叠时自碰撞阻挡和反向脱离。`python3 scripts/check_collision.py` 另可检查原生 MuJoCo 的接触力与穿透。
 
+真机控制的离线回归：
+
+```bash
+python3 -m unittest discover -s tests -p test_position_recovery.py -q
+```
+
+这些检查使用模拟设备与隔离的 HTTP 服务，不连接 USB，也不验证固件内部轨迹。已有浏览器测试会复用本地开发服务，真机在线时不要直接运行整套页面测试。
+
 ## 代码入口
 
 - `src/simulation.js`：加载本地 WASM 与 MJCF、固定步长仿真、六轴控制。
 - `src/viewer.js`：从 MuJoCo 编译后的网格与几何体变换构建 Three.js 画面。
 - `src/main.js`：控制面板、状态展示与事件连接。
+- `src/bridge-page-lifecycle.js`：桥接网页会话与关闭／恢复通知，不直接发送运动命令。
+- `src/panthera-serial.js`：独立 Web Serial 通信路径与能力限制。
+- `scripts/panthera_bridge.py`：HTTP、SDK 进程生命周期、回零协调及状态汇总。
+- `scripts/panthera_control.py`：共享命令格式、SDK 工作循环、位置及力矩控制。
 - `src/motor-telemetry.js`：单关节监控、历史采样及 Canvas 曲线。
 - `src/style.css`：桌面与移动端界面。
 

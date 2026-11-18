@@ -187,7 +187,7 @@ export class MotorTelemetry {
     const zeroPausesSampling = live && !this.disconnected &&
       ["queued", "writing"].includes(this.calibration?.phase);
     this.overview.hidden = !live;
-    this.calibrationPanel.hidden = Boolean(this.latest.readOnly);
+    this.calibrationPanel.hidden = Boolean(this.latest.readOnly || this.latest.usbDirect);
     this.drive.hidden = !live;
     if (live) {
       this.drive.textContent = "驱动模式 " + (joint.driveMode ?? "—");
