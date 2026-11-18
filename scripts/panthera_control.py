@@ -1,5 +1,6 @@
 """SDK 工作进程、反馈采集和控制模式交接；不包含 HTTP 或网页生命周期。"""
 
+import logging
 import math
 import multiprocessing
 import os
@@ -274,7 +275,45 @@ def external_serial_owners(ports):
     return sorted({int(pid) for pid in owners} - {os.getpid()})
 
 
+position_log = logging.getLogger("hthost.position")
+
+
+class PositionFeedbackLog:
+    """仅观察已发送的位置指令；首次完整反馈的耗时包含轮询延迟。"""
+
+    def __init__(self, session_id):
+        self.session_id = session_id
+        self.command_id = None
+        self.seen = set()
+
+    def observe(self, command_id, elapsed, arm, gripper, positions, velocities, modes):
+        if self.command_id != command_id:
+            self.command_id = command_id
+            self.seen.clear()
+        goals = (*(arm if arm is not None else (math.nan,) * ARM_JOINTS), gripper)
+        changes = []
+        for i, (goal, mode) in enumerate(zip(goals, modes)):
+            if not math.isfinite(goal):
+                continue
+            if mode == MOTOR_POSITION_MODE:
+                event = "首次10"
+            elif mode == 11:
+                event = "10后见11" if (i, "首次10") in self.seen else "见11，尚未见10"
+            else:
+                continue
+            if (i, event) not in self.seen:
+                self.seen.add((i, event))
+                changes.append(f"{motor_name(i)} {event} 偏差={positions[i]-goal:+.6g}rad "
+                               f"速度={velocities[i]:+.6g}rad/s")
+        if changes:
+            position_log.info("会话=%s 位置指令=%d +%.0fms %s", self.session_id, command_id,
+                              elapsed * 1000, "；".join(changes))
+
+
 def run_sdk_worker(session, errors):
+    position_log.setLevel(logging.INFO)
+    position_log.addHandler(logging.StreamHandler())
+    position_log.propagate = False
     monitor_robot(session, errors, exit_worker=os._exit)
 
 
@@ -321,6 +360,7 @@ def monitor_robot(session, errors, *, exit_worker=None):
         applied_command_id = 0
         applied_at = 0
         command_id = 0
+        feedback_log = PositionFeedbackLog(session.id)
         tracking_position = False
         position_settled_since = None
         completed_position_id = 0
@@ -379,6 +419,9 @@ def monitor_robot(session, errors, *, exit_worker=None):
                 if not robot.gripper_installed:
                     measured.append((math.nan, math.nan, math.nan, 0, 0))
                 positions, velocities, torques, motor_modes, motor_faults = zip(*measured)
+                if command_id and command_id == applied_command_id and active_mode in (POSITION, *POSITION_ACTIONS):
+                    feedback_log.observe(command_id, now - applied_at, target, gripper_target,
+                                         positions, velocities, motor_modes)
                 still = all(abs(value) <= POSITION_SETTLE_SPEED for value in velocities[:len(motors)])
                 still_since = (now if still_since is None else still_since) if still else None
                 session.zero[1] = still_since if still_since is not None else 0

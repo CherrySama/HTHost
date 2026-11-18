@@ -1,6 +1,7 @@
 """Expose the local Panthera SDK connection and its health to HTHost."""
 
 import json
+import logging
 import math
 import multiprocessing
 import signal
@@ -49,6 +50,17 @@ STOP_ACTION_ENDPOINT = "/api/panthera/actions/stop"
 ESTIMATE_ACTION_ENDPOINT = "/api/panthera/actions/estimate"
 START_RECORDING_ENDPOINT = "/api/panthera/actions/record/start"
 STOP_RECORDING_ENDPOINT = "/api/panthera/actions/record/stop"
+
+
+def outside_limit(session_id, axis, kind, value, limits):
+    lower, upper = limits
+    if lower <= value <= upper:
+        return False
+    direction, distance = ("低于下限", lower - value) if value < lower else ("高于上限", value - upper)
+    logging.getLogger("hthost.limits").warning(
+        "会话=%s %s %s=%.9g rad，允许 [%.9g, %.9g] rad，%s %.9g rad",
+        session_id, axis, kind, value, lower, upper, direction, distance)
+    return True
 
 
 class RobotConnection:
@@ -179,7 +191,7 @@ class RobotConnection:
                 for index, (position, (lower, upper)) in enumerate(
                     zip(positions, status["limits"]), start=1
                 ):
-                    if not lower <= position <= upper:
+                    if outside_limit(status["session"], f"J{index}", "目标", position, (lower, upper)):
                         return 400, {"message": f"J{index} 目标超出真机关节限位"}
                 arm_speed = speed
 
@@ -188,7 +200,7 @@ class RobotConnection:
                 if limits is None:
                     return 409, {"message": "夹爪未连接"}
                 gripper = request["gripper"]
-                if not is_finite_number(gripper) or not limits[0] <= gripper <= limits[1]:
+                if not is_finite_number(gripper) or outside_limit(status["session"], "夹爪", "目标", gripper, limits):
                     return 400, {"message": "目标超出夹爪限位"}
                 gripper_speed = min(speed, GRIPPER_MAX_SPEED)
 
@@ -232,8 +244,8 @@ class RobotConnection:
             if mode == status["mode"]:
                 return 200, {"mode": mode}
             if any(
-                not lower <= position <= upper
-                for position, (lower, upper) in zip(status["positions"], status["limits"])
+                outside_limit(status["session"], motor_name(i), "实测", position, limits)
+                for i, (position, limits) in enumerate(zip(status["positions"], status["limits"]))
             ):
                 return 409, {"message": "实测姿态超出关节限位，无法切换控制模式"}
 
@@ -261,8 +273,9 @@ class RobotConnection:
 
         limits = status["limits"]
         gripper_limits = status["gripperLimits"]
-        if any(not lower <= 0 <= upper for lower, upper in limits) or (
-            gripper_limits and not gripper_limits[0] <= 0 <= gripper_limits[1]
+        if any(outside_limit(status["session"], motor_name(i), "回零目标", 0, bounds)
+               for i, bounds in enumerate(limits)) or (
+            gripper_limits and outside_limit(status["session"], "夹爪", "回零目标", 0, gripper_limits)
         ):
             return 409, {"message": "零位超出真机限位"}
 

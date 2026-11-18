@@ -317,6 +317,21 @@ class BridgeReconnectTests(unittest.TestCase):
         self.assertEqual(server.request("POST", bridge.POSITION_ENDPOINT, request)[0], 202)
         self.assertEqual(server.robot.session.command[1], control.POINT_POSITION)
 
+    def test_rejected_gripper_target_logs_limit_without_queueing(self):
+        server = self.bridge
+        ready = server.robot.context.Event()
+        ready.set()
+        with patch.object(bridge, "run_sdk_worker", partial(reconnect_worker, feedback_ready=ready)):
+            server.request("POST")
+        status = server.wait_for_connection()
+        request = {"session": status["session"], "gripper": -.0006, "speed": .2}
+        with self.assertLogs("hthost.limits", level="WARNING") as logs:
+            code, result = server.request("POST", bridge.POSITION_ENDPOINT, request)
+        self.assertEqual((code, result), (400, {"message": "目标超出夹爪限位"}))
+        self.assertEqual(server.robot.session.command[0], 0)
+        self.assertEqual(len(logs.records), 1)
+        self.assertIn("夹爪 目标=-0.0006 rad，允许 [0, 2] rad，低于下限 0.0006 rad", logs.output[0])
+
     def test_position_request_fails_when_command_lock_hangs_after_status_check(self):
         server = self.bridge
         context = server.robot.context
@@ -689,6 +704,28 @@ assert.equal(requests.length, 4);
 
 class PositionRecoveryTests(unittest.TestCase):
     """下面的记录器替代硬件，生产控制流程保持原样。"""
+
+    def test_position_log_distinguishes_first_response_and_later_timeout(self):
+        for ignore in (True, False):
+            with self.subTest(ignore=ignore):
+                device = PersistentDevice(.2)
+                device.timeout_ms = 250
+                device.ignore_position = ignore
+                goal = control.ControlCommand(1, control.POINT_POSITION, speed=.2, targets=(.6,) * 6)
+                with self.assertLogs("hthost.position", level="INFO") as logs:
+                    robot, _, errors = run_bridge(device.positions, commands={2: goal.pack()},
+                                                  device=device, ticks=50)
+                self.assertEqual(errors, [])
+                self.assertEqual([c[1] for c in robot.calls if c[1] != 0x06], [0x90])
+                self.assertEqual(len(logs.records), 1 if ignore else 2)
+                self.assertIn("位置指令=1 +40ms", logs.output[0])
+                for i in range(1, 7):
+                    self.assertIn(f"J{i} " + ("见11，尚未见10" if ignore else "首次10"), logs.output[0])
+                    if not ignore:
+                        self.assertIn(f"J{i} 10后见11", logs.output[1])
+                self.assertNotIn("夹爪", "".join(logs.output))
+                self.assertIn("偏差=", logs.output[0])
+                self.assertIn("速度=", logs.output[0])
 
     def test_return_refreshes_until_settled_without_page_or_timeout_configuration(self):
         command = [1, control.POINT_POSITION, 0.2, 0.2, 0, 110, *([0] * 6)]
