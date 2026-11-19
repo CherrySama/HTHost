@@ -1,3 +1,4 @@
+import { readPantheraResponse } from "./panthera-response.js";
 import "./style.css";
 import { Simulation } from "./simulation.js";
 import { Viewer } from "./viewer.js";
@@ -119,6 +120,7 @@ let requestedMode;
 let positionCommandId;
 
 const modeDescriptions = {
+  damping: "已发送阻尼指令，机械臂可能下落。选择控制模式后再操作。",
   position: "调整目标角度和速度，然后发送位置。",
   gravity: "重力补偿已开启，可手动引导机械臂。",
   gravity_friction: "重力与摩擦补偿已开启，可手动引导机械臂。",
@@ -158,7 +160,7 @@ async function refreshRobotStatus(method = "GET", initial = false) {
       signal: AbortSignal.timeout(5000),
     });
     if (request !== robotRequest) return;
-    const status = await response.json();
+    const status = await readPantheraResponse(response);
     if (request !== robotRequest) return;
     if (method === "DELETE" && response.status === 409) {
       showMotionMessage(status.message);
@@ -166,7 +168,7 @@ async function refreshRobotStatus(method = "GET", initial = false) {
       robotStatusTimer = setTimeout(refreshRobotStatus, 500);
       return;
     }
-    if (!response.ok) throw new Error("连接服务不可用");
+    if (!response.ok) throw new Error(status.message || "连接服务不可用");
     if (!Object.hasOwn(robotStatusLabels, status.state)) throw new Error("连接服务响应无效");
     bridgeAvailable = true;
     bridgeLifecycle.setSession(status.session);
@@ -179,12 +181,12 @@ async function refreshRobotStatus(method = "GET", initial = false) {
     if (["connecting", "connected", "homing", "calibrating"].includes(status.state)) {
       robotStatusTimer = setTimeout(refreshRobotStatus, status.state === "connecting" ? 500 : 100);
     }
-  } catch {
+  } catch (error) {
     if (!initial && request === robotRequest) {
       const returning = method === "DELETE" || robotConnection.dataset.state === "homing";
       showRobotStatus({
         state: "error",
-        message: returning ? "回零未确认：无法访问真机连接服务" : "无法访问真机连接服务",
+        message: (returning ? "回零未确认：" : "") + (error.message || "无法访问真机连接服务"),
       });
     }
   } finally {
@@ -521,7 +523,8 @@ function updateMotionControls() {
     displayGripperTarget(simulation.gripperTarget);
     telemetry.update(simulation.getMotorTelemetry(), simulation.paused);
   }
-  robotButton.disabled = bridgeChecking || Boolean(sdkLocked || sdkRecording)
+  const canTakeOverForHome = state === "connected" && !robotPose?.usbDirect && !serialConnection;
+  robotButton.disabled = bridgeChecking || (!canTakeOverForHome && Boolean(sdkLocked || sdkRecording))
     || ["connecting", "disconnecting", "homing", "calibrating"].includes(state);
   document.querySelector("#reset").disabled = Boolean(sdkLocked || sdkRecording);
   sdk?.refresh();
@@ -578,7 +581,7 @@ async function postPanthera(path, payload) {
     body: JSON.stringify(payload),
     signal: AbortSignal.timeout(5000),
   });
-  const result = await response.json();
+  const result = await readPantheraResponse(response);
   if (!response.ok) throw new Error(result.message || "真机动作请求失败");
   return result;
 }
@@ -595,14 +598,7 @@ for (const button of robotModeButtons) {
     showMotionMessage("");
     updateMotionControls();
     try {
-      const response = await fetch("/api/panthera/mode", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ session, mode }),
-        signal: AbortSignal.timeout(5000),
-      });
-      const result = await response.json();
-      if (!response.ok) throw new Error(result.message);
+      await postPanthera("/mode", { session, mode });
     } catch (error) {
       if (robotPose?.session !== session || requestedMode !== mode) return;
       requestedMode = undefined;

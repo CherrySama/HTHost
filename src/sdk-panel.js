@@ -94,7 +94,8 @@ export const sdkPanel = `
 
 const phaseLabels = {
   approach: "前往起点", playing: "执行路径", finishing: "确认到位", dwell: "停留",
-  stopping: "正在停止", stopped: "已停止，保持当前位置", done: "动作完成",
+  stopping: "正在停止", stopped: "动作已停止，已发送阻尼指令", done: "动作完成",
+  cancelled: "动作已取消，正在回零",
 };
 
 export function createSdkPanel(callbacks) {

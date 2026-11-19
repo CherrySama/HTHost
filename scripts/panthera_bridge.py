@@ -5,6 +5,7 @@ import logging
 import math
 import multiprocessing
 import signal
+import sys
 import time
 from contextlib import contextmanager
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -14,7 +15,7 @@ if __package__:
     from .panthera_control import (
         ARM_JOINTS, ControlCommand, CONTROL_INTERVAL, CONTROL_LEASE, CONTROL_MODES, FEEDBACK_TIMEOUT,
         GRIPPER_MAX_SPEED, MOTOR_POSITION_MODE, MOTOR_SLOTS, MOVE_POSITION, NATIVE_MODES,
-        PAUSE_COMMANDS, PAUSE_POSITION, POINT_PAUSE, POINT_POSITION, POSITION_ACTIONS,
+        PAUSE_COMMANDS, SDK_DAMPING, POINT_PAUSE, POINT_POSITION, POSITION_ACTIONS,
         POSITION_RESPONSE_SECONDS, POSITION_SETTLE_SPEED, POSITION_TOLERANCE, RETURN_SPEED, RobotSession,
         SDK, SDK_REPLAY, SDK_SINE, STARTUP_TIMEOUT, STREAM_POSITION,
         SharedStateTimeout, WRITE_ZERO, ZERO_QUEUED, ZERO_STILL_SECONDS, ZERO_TOLERANCE,
@@ -27,7 +28,7 @@ else:
     from panthera_control import (
         ARM_JOINTS, ControlCommand, CONTROL_INTERVAL, CONTROL_LEASE, CONTROL_MODES, FEEDBACK_TIMEOUT,
         GRIPPER_MAX_SPEED, MOTOR_POSITION_MODE, MOTOR_SLOTS, MOVE_POSITION, NATIVE_MODES,
-        PAUSE_COMMANDS, PAUSE_POSITION, POINT_PAUSE, POINT_POSITION, POSITION_ACTIONS,
+        PAUSE_COMMANDS, SDK_DAMPING, POINT_PAUSE, POINT_POSITION, POSITION_ACTIONS,
         POSITION_RESPONSE_SECONDS, POSITION_SETTLE_SPEED, POSITION_TOLERANCE, RETURN_SPEED, RobotSession,
         SDK, SDK_REPLAY, SDK_SINE, STARTUP_TIMEOUT, STREAM_POSITION,
         SharedStateTimeout, WRITE_ZERO, ZERO_QUEUED, ZERO_STILL_SECONDS, ZERO_TOLERANCE,
@@ -50,6 +51,13 @@ STOP_ACTION_ENDPOINT = "/api/panthera/actions/stop"
 ESTIMATE_ACTION_ENDPOINT = "/api/panthera/actions/estimate"
 START_RECORDING_ENDPOINT = "/api/panthera/actions/record/start"
 STOP_RECORDING_ENDPOINT = "/api/panthera/actions/record/stop"
+
+
+command_log = logging.getLogger("hthost.bridge.command")
+
+
+def queued(session, command_id, source):
+    command_log.info("会话=%s 命令=%d 阶段=桥接入队 来源=%s", session.id, command_id, source)
 
 
 def outside_limit(session_id, axis, kind, value, limits):
@@ -140,11 +148,13 @@ class RobotConnection:
             self.zero_deadline = now + ZERO_WRITE_TIMEOUT
             session.zero[:] = [ZERO_QUEUED, 0, *([math.nan] * MOTOR_SLOTS)]
             session.last_status_request.value = now
+            command_id = session.command[0] + 1
             session.command[:] = ControlCommand(
-                session.command[0] + 1, WRITE_ZERO,
+                command_id, WRITE_ZERO,
                 gripper=expected[-1] if len(expected) == MOTOR_SLOTS else math.nan,
                 targets=expected[:ARM_JOINTS],
             ).pack()
+            queued(session, command_id, "用户写零")
             Thread(target=self._watch_zero, args=(session,), daemon=True).start()
             return 202, {"phase": "queued"}
 
@@ -210,6 +220,8 @@ class RobotConnection:
                 command_id, POINT_POSITION, speed=arm_speed, gripper_speed=gripper_speed,
                 gripper=gripper, targets=positions,
             ).pack()
+            source = "用户关节与夹爪位置" if has_arm and has_gripper else ("用户关节位置" if has_arm else "用户夹爪位置")
+            queued(self.session, command_id, source)
             return 202, {"message": "位置目标已提交，等待电机反馈", "commandId": int(command_id)}
 
     def pause_position(self, request):
@@ -222,7 +234,16 @@ class RobotConnection:
             if status["positionPhase"] != "moving" or request.get("commandId") != status["positionStatus"]["commandId"]:
                 return 409, {"message": "该位置指令已结束或正在停稳"}
             self.session.last_status_request.value = time.monotonic()
-            self._queue_action_pose(POINT_PAUSE)
+            command = self.session.command
+            with command.locked():
+                prior = ControlCommand.unpack(command[:])
+                if prior.mode != POINT_POSITION or prior.id != request["commandId"] or prior.return_deadline:
+                    return 409, {"message": "原位置指令已替换，未请求暂停"}
+                # Copy the selected groups, never the old target positions. The worker may
+                # still be executing an earlier command when this replaces the queued goal.
+                command[:] = ControlCommand(prior.id + 1, POINT_PAUSE, speed=prior.speed,
+                                            gripper_speed=prior.gripper_speed).pack()
+            queued(self.session, prior.id + 1, f"用户位置暂停 原命令={int(prior.id)}")
             return 202, {"message": "已请求暂停，正在停稳"}
 
     def set_mode(self, request):
@@ -251,26 +272,25 @@ class RobotConnection:
 
             command = self.session.command
             self.session.last_status_request.value = time.monotonic()
-            command[:] = ControlCommand(command[0] + 1, CONTROL_MODES.index(mode)).pack()
+            command_id = command[0] + 1
+            command[:] = ControlCommand(command_id, CONTROL_MODES.index(mode)).pack()
+            queued(self.session, command_id, f"用户模式切换 {status['mode']}->{mode}")
             return 202, {"mode": mode}
 
     def return_and_disconnect(self, request):
         with self.lock, self._recover_shared_state():
             return self._return_and_disconnect(request)
 
-    def _return_and_disconnect(self, request):
+    def _return_and_disconnect(self, request, source="主动断开回零"):
         status = self._status()
+        if status["state"] == "error":
+            return 409, {"message": status["message"]}
         if request.get("session") != status.get("session"):
             return 409, {"message": "真机连接已失效，请重新连接"}
         if status["state"] == "homing":
             return 202, status
         if status["state"] != "connected":
             return 409, {"message": "真机当前无法回零"}
-        if self.action and self.action.active:
-            return 409, {"message": "请先停止 SDK 动作"}
-        if self.recording and self.recording.active:
-            return 409, {"message": "请先停止轨迹录制"}
-
         limits = status["limits"]
         gripper_limits = status["gripperLimits"]
         if any(outside_limit(status["session"], motor_name(i), "回零目标", 0, bounds)
@@ -286,13 +306,24 @@ class RobotConnection:
         if gripper_limits:
             travel_time = max(travel_time, abs(status["gripper"]) / gripper_speed)
         now = time.monotonic()
-        self.return_deadline = now + max(8, travel_time + 5)
+        deadline = now + max(8, travel_time + 5)
         command = self.session.command
         self.session.last_status_request.value = now
+        command_id = command[0] + 1
         command[:] = ControlCommand(
-            command[0] + 1, POINT_POSITION, speed=speed, gripper_speed=gripper_speed,
-            gripper=gripper_target, return_deadline=self.return_deadline,
+            command_id, POINT_POSITION, speed=speed, gripper_speed=gripper_speed,
+            gripper=gripper_target, return_deadline=deadline,
         ).pack()
+        queued(self.session, command_id, source)
+        # Both producer threads check active under this same connection lock.
+        # Only revoke them once the validated home command has replaced the old command.
+        self.return_deadline = deadline
+        if self.action and self.action.active:
+            self.action.phase = "cancelled"
+            status["action"] = self.action.status()
+        if self.recording and self.recording.active:
+            self.recording.active = False
+            status["recording"] = self.recording.status()
         Thread(target=self._watch_return, args=(self.session,), daemon=True).start()
         status["state"] = "homing"
         return 202, status
@@ -329,7 +360,7 @@ class RobotConnection:
             if (self.session is not session or self.pages.get(page) != (stamp, True)
                     or any(not leaving for _, leaving in self.pages.values())):
                 return
-            code, result = self._return_and_disconnect({"session": session.id})
+            code, result = self._return_and_disconnect({"session": session.id}, "关页回零")
             if code != 202:
                 print(f"网页关闭后未回零：{result.get('message', '')}", flush=True)
 
@@ -454,9 +485,11 @@ class RobotConnection:
         run.phase = "approach"
         run.deadline = now + max(8, travel + 5)
         run.command_id = self._queue_action_pose(MOVE_POSITION, run.speed, pose)
+        queued(self.session, run.command_id, "SDK动作接近起点")
 
     def _stop_action(self, run, now, message=""):
-        run.command_id = self._queue_action_pose(PAUSE_POSITION)
+        run.command_id = self._queue_action_pose(SDK_DAMPING)
+        queued(self.session, run.command_id, "SDK自动停止阻尼：" + message if message else "用户停止SDK动作阻尼")
         run.phase = "stopping"
         run.deadline = now + 8
         run.message = message
@@ -484,10 +517,12 @@ class RobotConnection:
         motion = status["positionStatus"]
         settled = motion and motion.get("completed") and motion["commandId"] == run.command_id
         if run.phase == "stopping":
-            if settled:
+            if status["appliedCommand"] == run.command_id:
                 run.phase = "error" if run.message else "stopped"
-            elif now >= run.deadline and not run.message:
-                run.message = "未能确认已停稳，继续保持停止目标"
+                command_log.info("会话=%s 命令=%d 阶段=SDK停止派发已报告 动作结果=%s",
+                                 self.session.id, run.command_id, run.phase)
+            elif now >= run.deadline:
+                self._fail_worker("未确认 SDK 阻尼指令已发送")
             return
         if now - self.session.last_status_request.value > CONTROL_LEASE - 0.5:
             self._stop_action(run, now, "网页失联，动作已取消")
@@ -497,6 +532,7 @@ class RobotConnection:
                 run.since = now
                 if native and run.phase == "playing":
                     run.command_id = self._queue_native_trajectory(native)
+                    queued(self.session, run.command_id, f"SDK原生轨迹 {native.kind}")
                     run.deadline = now + 3
             elif now >= run.deadline:
                 self._stop_action(run, now, "未能到达动作目标")
@@ -513,8 +549,12 @@ class RobotConnection:
                 run.phase = "finishing"
                 run.deadline = now + 8
                 run.command_id = self._queue_action_pose(MOVE_POSITION, run.speed, poses[-1])
+                queued(self.session, run.command_id, "SDK动作到达终点")
             elif not native:
-                self._queue_action_pose(STREAM_POSITION, run.speed, run.sample(elapsed))
+                stream_id = self._queue_action_pose(STREAM_POSITION, run.speed, run.sample(elapsed))
+                # One record per contiguous stream, not one synchronous log per sample.
+                if stream_id == run.command_id + 1:
+                    queued(self.session, stream_id, "SDK流式轨迹起始（后续连续命令同源）")
         elif now - run.since >= dwell and run.advance():
             self._approach_action(run, status, now)
 
@@ -567,7 +607,7 @@ class RobotConnection:
                 self.message = "零位反馈未通过验证，请核对各电机零位后再控制"
             elif not zero_active:
                 self.zero_deadline = 0
-            last_feedback, confirmed_mode, rejected_id, applied_id, applied_at, completed_id, *feedback = self.session.feedback[:]
+            last_feedback, confirmed_mode, rejected_id, applied_id, applied_at, completed_id, *feedback, position_mask = self.session.feedback[:]
             if not self.message:
                 if self.return_deadline and now >= self.return_deadline:
                     self.message = "等待到位超时"
@@ -578,10 +618,12 @@ class RobotConnection:
                 elif not last_feedback:
                     return {"state": "connecting"}
                 else:
-                    mode = CONTROL_MODES[int(confirmed_mode)]
+                    mode = "damping" if confirmed_mode == SDK_DAMPING else CONTROL_MODES[int(confirmed_mode)]
                     request_id, requested_code, arm_speed, gripper_speed = self.session.command[:4]
                     position_phase = None
-                    if requested_code in (*POSITION_ACTIONS, STREAM_POSITION, WRITE_ZERO, *NATIVE_MODES):
+                    if requested_code == SDK_DAMPING:
+                        requested_mode = "damping"
+                    elif requested_code in (*POSITION_ACTIONS, STREAM_POSITION, WRITE_ZERO, *NATIVE_MODES):
                         requested_mode = "position"
                         if requested_code in POSITION_ACTIONS and request_id != completed_id:
                             position_phase = "settling" if requested_code in PAUSE_COMMANDS else "moving"
@@ -618,7 +660,7 @@ class RobotConnection:
                                 for index, motor in enumerate(motors)
                             ]
                         position_status = (
-                            describe_position_status(command_motors, applied_id, last_feedback - applied_at)
+                            describe_position_status(command_motors, applied_id, last_feedback - applied_at, int(position_mask))
                             if applied_id == request_id else
                             {"commandId": int(request_id), "message": "位置目标已提交，等待电机反馈"}
                         )
@@ -684,6 +726,9 @@ class RobotConnection:
                 "positions": [value if math.isfinite(value) else None for value in (zero_positions or [])],
                 "tolerance": ZERO_TOLERANCE,
             }
+        command_log.warning("会话=%s 阶段=桥接结束异常会话 worker_pid=%s exitcode=%s 原因=%s",
+                            getattr(self.session, 'id', None), getattr(self.worker, 'pid', None),
+                            getattr(self.worker, 'exitcode', None), message)
         self.message = message
         self._stop_worker()
         return self._connection_error()
@@ -720,7 +765,7 @@ def is_finite_number(value):
     return type(value) in (int, float) and -math.inf < value < math.inf
 
 
-def describe_position_status(motors, command_id, elapsed):
+def describe_position_status(motors, command_id, elapsed, position_mask=0):
     unfinished = [
         (index, motor)
         for index, motor in enumerate(motors)
@@ -730,15 +775,19 @@ def describe_position_status(motors, command_id, elapsed):
     ]
     inactive = [
         f"{motor_name(index)}（模式 {motor['driveMode']}）"
-        for index, motor in unfinished
-        if motor["driveMode"] != MOTOR_POSITION_MODE and abs(motor["velocity"]) <= POSITION_SETTLE_SPEED
+        for index, motor in enumerate(motors)
+        if motor["target"] is not None and motor["driveMode"] != MOTOR_POSITION_MODE
     ]
-    if not unfinished:
-        message = "已到达位置目标，正在确认停稳"
+    exited = [f"{motor_name(i)}（模式 {m['driveMode']}）" for i, m in enumerate(motors)
+              if m["target"] is not None and position_mask & (1 << i) and m["driveMode"] != MOTOR_POSITION_MODE]
+    if exited:
+        message = f"电机已退出位置控制，到位未确认：{'、'.join(exited)}"
     elif inactive and elapsed >= POSITION_RESPONSE_SECONDS:
-        message = f"电机未进入位置控制：{'、'.join(inactive)}"
+        message = f"尚未观察到电机进入位置控制：{'、'.join(inactive)}"
     elif inactive:
         message = "位置目标已提交，等待电机反馈"
+    elif not unfinished:
+        message = "已到达位置目标，正在确认停稳"
     else:
         message = "电机已响应，尚未到位"
     return {"commandId": int(command_id), "message": message}
@@ -774,22 +823,22 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_DELETE(self):
         if self.path != ENDPOINT:
-            self.send_error(404)
+            self.send_json(404, {"message": "真机服务接口不存在"})
             return
         self.respond_with_request(self.server.robot.return_and_disconnect)
 
     def respond(self, action, mutation=False):
         if self.path != ENDPOINT:
-            self.send_error(404)
+            self.send_json(404, {"message": "真机服务接口不存在"})
             return
         if mutation and self.headers.get("Content-Type") != "application/json":
-            self.send_error(415)
+            self.send_json(415, {"message": "请求必须使用 application/json"})
             return
-        self.send_json(200, action())
+        self.call(lambda: (200, action()))
 
     def respond_with_request(self, action, max_length=4096):
         if self.headers.get("Content-Type") != "application/json":
-            self.send_error(415)
+            self.send_json(415, {"message": "请求必须使用 application/json"})
             return
         try:
             length = int(self.headers.get("Content-Length", "0"))
@@ -802,10 +851,16 @@ class Handler(BaseHTTPRequestHandler):
         except (ValueError, OSError):
             self.send_json(400, {"message": "无效的真机控制请求"})
             return
+        self.call(lambda: action(request))
+
+    def call(self, action):
         try:
-            result = action(request)
+            result = action()
         except SharedStateTimeout as exc:
             result = 409, {"message": str(exc)}
+        except Exception:
+            logging.getLogger(__name__).exception("真机服务处理 %s %s 失败", self.command, self.path)
+            result = 500, {"message": "真机服务处理请求失败，结果未确认，请查看桥接日志"}
         self.send_json(*result)
 
     def send_json(self, status, payload):
@@ -826,6 +881,12 @@ def main():
     def shutdown(_signum, _frame):
         raise KeyboardInterrupt
 
+    command_log.setLevel(logging.INFO)
+    command_handler = logging.StreamHandler()
+    command_handler.setFormatter(logging.Formatter('%(asctime)s pid=%(process)d %(message)s'))
+    command_log.addHandler(command_handler)
+    command_log.info('阶段=桥接启动 超时历史=未知（未读回设备配置）')
+    command_log.propagate = False
     signal.signal(signal.SIGTERM, shutdown)
     with ThreadingHTTPServer(("127.0.0.1", 5174), Handler) as server:
         server.robot = RobotConnection()

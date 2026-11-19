@@ -13,8 +13,10 @@ from pathlib import Path
 import uuid
 
 if __package__:
+    from .control_trace import ControlTrace
     from .sdk_actions import MAX_NATIVE_FRAMES, NATIVE_WIDTH, native_target
 else:
+    from control_trace import ControlTrace
     from sdk_actions import MAX_NATIVE_FRAMES, NATIVE_WIDTH, native_target
 
 SDK = Path(__file__).resolve().parents[1] / "Panthera-HT_SDK" / "panthera_python"
@@ -43,6 +45,7 @@ MOVE_POSITION, PAUSE_POSITION, STREAM_POSITION, SDK_SINE, SDK_REPLAY = range(len
 NATIVE_MODES = (SDK_SINE, SDK_REPLAY)
 WRITE_ZERO = SDK_REPLAY + 1
 POINT_POSITION, POINT_PAUSE = WRITE_ZERO + 1, WRITE_ZERO + 2
+SDK_DAMPING = POINT_PAUSE + 1
 POINT_COMMANDS = (POINT_POSITION, POINT_PAUSE)
 PAUSE_COMMANDS = (PAUSE_POSITION, POINT_PAUSE)
 ZERO_TOLERANCE = 0.01
@@ -145,12 +148,20 @@ class RobotSession:
                                       else context.RawValue("b", False))
         self.stop = StopRequest(context)
         self.returned = context.RawValue("b", False)
-        self.feedback = SessionArray(context, 6 + 6 * MOTOR_SLOTS)
+        self.feedback = SessionArray(context, 7 + 6 * MOTOR_SLOTS)  # final field: observed position-mode axis mask
         self.limits = SessionArray(context, 2 * ARM_JOINTS + 3)
         self.command = SessionArray(context, ControlCommand(0, POSITION).pack())
         self.trajectory = context.RawArray("d", MAX_NATIVE_FRAMES * NATIVE_WIDTH)
         self.last_status_request = context.Value("d", 0, lock=False)
         self.zero = SessionArray(context, [0, 0, *([math.nan] * MOTOR_SLOTS)])
+
+
+    @contextmanager
+    def dispatch(self, observed_id):
+        # While impedance waits for stillness, the old controller intentionally owns
+        # the output. Its permission ends when the observed request is replaced.
+        with self.command.locked():
+            yield self.command[0] == observed_id and not self.stop.is_set()
 
 
 class TorqueControl:
@@ -218,8 +229,14 @@ class TorqueControl:
 def enable_control_watchdog(robot, session):
     # Mark before writing: a disconnected SDK call may not report whether the device received it.
     session.timed_control_started.value = True
+    value = control_watchdog_ms(robot)
+    robot.set_timeout(value)
+    return value
+
+
+def control_watchdog_ms(robot):
     timeout = robot.motor_timeout_ms
-    robot.set_timeout(min(timeout, CONTROL_WATCHDOG_MS) if timeout > 0 else CONTROL_WATCHDOG_MS)
+    return min(timeout, CONTROL_WATCHDOG_MS) if timeout > 0 else CONTROL_WATCHDOG_MS
 
 
 def send_position_target(robot, arm, speeds, gripper, gripper_speed):
@@ -242,7 +259,7 @@ def send_sdk_target(robot, mode, target, measured):
         # The sine step inherits the gripper target reached during approach.
         if not robot.Joint_Pos_Vel(positions, velocities, iswait=False):
             raise RuntimeError("SDK 拒绝了正弦轨迹目标")
-        return
+        return {"axes": ARM_AXES, "targets": list(positions), "velocities": list(velocities), "policy": "stream"}
 
     gravity = robot.get_Gravity(measured[:ARM_JOINTS])
     if len(gravity) != ARM_JOINTS or not all(math.isfinite(value) for value in gravity):
@@ -258,6 +275,25 @@ def send_sdk_target(robot, mode, target, measured):
             raise RuntimeError("SDK 拒绝了夹爪回放目标")
     if not robot.pos_vel_tqe_kp_kd(positions, velocities, torques, SDK_REPLAY_KP, SDK_REPLAY_KD):
         raise RuntimeError("SDK 拒绝了关节回放目标")
+    details = {"axes": ALL_AXES if robot.has_gripper else ARM_AXES, "targets": list(positions),
+               "velocities": list(velocities), "torques": torques, "policy": "stream"}
+    if robot.has_gripper:
+        details["gripper_mit"] = gripper_command
+    return details
+
+
+ARM_AXES = tuple(f"J{i + 1}" for i in range(ARM_JOINTS))
+ALL_AXES = (*ARM_AXES, "夹爪")
+
+
+def trace_position(trace, command_id, kind, arm, gripper, policy):
+    axes = list(ARM_AXES) if arm is not None else []
+    targets = list(arm) if arm is not None else []
+    if math.isfinite(gripper):
+        axes.append("夹爪")
+        targets.append(gripper)
+    if axes:  # no-op calls are not dispatches
+        trace.write(command_id, kind, {"axes": axes, "targets": targets, "policy": policy})
 
 
 def external_serial_owners(ports):
@@ -286,6 +322,11 @@ class PositionFeedbackLog:
         self.command_id = None
         self.seen = set()
 
+    def position_mask(self, command_id):
+        if command_id != self.command_id:
+            return 0
+        return sum(1 << i for i, event in self.seen if event == "首次10")
+
     def observe(self, command_id, elapsed, arm, gripper, positions, velocities, modes):
         if self.command_id != command_id:
             self.command_id = command_id
@@ -311,14 +352,19 @@ class PositionFeedbackLog:
 
 
 def run_sdk_worker(session, errors):
-    position_log.setLevel(logging.INFO)
-    position_log.addHandler(logging.StreamHandler())
-    position_log.propagate = False
+    handler = logging.StreamHandler()
+    handler.setFormatter(logging.Formatter('%(asctime)s pid=%(process)d %(message)s'))
+    for logger in (position_log, logging.getLogger('hthost.trace')):
+        logger.setLevel(logging.INFO)
+        logger.addHandler(handler)
+        logger.propagate = False
     monitor_robot(session, errors, exit_worker=os._exit)
 
 
 def monitor_robot(session, errors, *, exit_worker=None):
     stop = session.stop
+    trace = ControlTrace(session.id)
+    loss_reported_for = None
     try:
         ports = sorted(port for port in Path("/dev").glob("ttyACM*") if port.is_char_device())
         if not ports:
@@ -361,6 +407,8 @@ def monitor_robot(session, errors, *, exit_worker=None):
         applied_at = 0
         command_id = 0
         feedback_log = PositionFeedbackLog(session.id)
+        position_mode_seen = set()
+        last_point_write = 0
         tracking_position = False
         position_settled_since = None
         completed_position_id = 0
@@ -419,15 +467,30 @@ def monitor_robot(session, errors, *, exit_worker=None):
                 if not robot.gripper_installed:
                     measured.append((math.nan, math.nan, math.nan, 0, 0))
                 positions, velocities, torques, motor_modes, motor_faults = zip(*measured)
+                trace.sample(command_id, positions[:len(motors)], velocities[:len(motors)],
+                             motor_modes[:len(motors)], motor_faults[:len(motors)])
                 if command_id and command_id == applied_command_id and active_mode in (POSITION, *POSITION_ACTIONS):
                     feedback_log.observe(command_id, now - applied_at, target, gripper_target,
                                          positions, velocities, motor_modes)
+                    # Refresh/homing failures are raised below. Single dispatch has no such exception.
+                    if (loss_reported_for != command_id and not return_deadline and
+                            (active_mode not in (POSITION, *POINT_COMMANDS) or not session.timed_control_started.value)):
+                        mask = feedback_log.position_mask(command_id)
+                        lost = [motor_name(i) for i, mode in enumerate(motor_modes)
+                                if mask & (1 << i) and mode != MOTOR_POSITION_MODE]
+                        goals = (*(target if target is not None else (math.nan,) * ARM_JOINTS), gripper_target)
+                        missing = [motor_name(i) for i, goal in enumerate(goals)
+                                   if math.isfinite(goal) and motor_modes[i] != MOTOR_POSITION_MODE]
+                        if lost or (missing and now - applied_at >= POSITION_RESPONSE_SECONDS):
+                            trace.failure(("位置模式丢失：" if lost else "未确认位置模式：") + "、".join(lost or missing))
+                            loss_reported_for = command_id
                 still = all(abs(value) <= POSITION_SETTLE_SPEED for value in velocities[:len(motors)])
                 still_since = (now if still_since is None else still_since) if still else None
                 session.zero[1] = still_since if still_since is not None else 0
                 session.feedback[:] = [
                     now, confirmed_mode, rejected_mode_id, applied_command_id, applied_at, completed_position_id,
                     *positions, *velocities, *torques, *applied_targets, *motor_modes, *motor_faults,
+                    feedback_log.position_mask(applied_command_id),
                 ]
                 pending = {motor.get_motor_id(): motor for motor in motors}
                 if zero_verify_deadline:
@@ -440,11 +503,29 @@ def monitor_robot(session, errors, *, exit_worker=None):
                     elif not healthy or now >= zero_verify_deadline:
                         phase = ZERO_UNVERIFIED
                     session.zero[:] = [phase, session.zero[1], *positions]
+                    if phase == ZERO_UNVERIFIED:
+                        trace.failure("零位写入后读回未确认")
                     if phase != ZERO_VERIFYING:
                         zero_verify_deadline = 0
                     continue
                 next_id, mode, speed, next_gripper_speed, next_gripper, deadline, next_target = ControlCommand.unpack(session.command[:])
                 accept_command = next_id != command_id and next_id != rejected_mode_id
+                if mode == SDK_DAMPING:
+                    if accept_command:
+                        with session.dispatch(next_id) as current:
+                            if not current:
+                                continue
+                            if robot.set_brake() is False:
+                                raise RuntimeError("SDK 阻尼指令发送失败")
+                        trace.write(next_id, "sdk_damping", {"axes": ALL_AXES[:len(motors)], "policy": "once"})
+                        native_mode = torque_control = target = None
+                        gripper_target = math.nan
+                        tracking_position = False
+                        applied_targets = [math.nan] * MOTOR_SLOTS
+                        active_mode = confirmed_mode = SDK_DAMPING
+                        command_id = applied_command_id = next_id
+                        applied_at = now
+                    continue
                 if accept_command and mode == WRITE_ZERO:
                     command_id = next_id
                     if (confirmed_mode != POSITION or torque_control or native_mode or any(motor_faults)
@@ -461,9 +542,13 @@ def monitor_robot(session, errors, *, exit_worker=None):
                     gripper_target = math.nan
                     applied_targets = [math.nan] * MOTOR_SLOTS
                     tracking_position = False
-                    session.zero[0] = ZERO_WRITING
-                    robot.set_reset_zero()
-                    robot.motor_send_cmd()
+                    with session.dispatch(next_id) as current:
+                        if not current:
+                            continue
+                        session.zero[0] = ZERO_WRITING
+                        robot.set_reset_zero()
+                        robot.motor_send_cmd()
+                    trace.write(command_id, "write_zero", {"axes": ALL_AXES[:len(motors)], "policy": "once"})
                     # A pre-write packet cannot verify a new zero.
                     timestamps = {motor_id: motor.get_current_motor_state().time
                                   for motor_id, motor in pending.items()}
@@ -485,10 +570,12 @@ def monitor_robot(session, errors, *, exit_worker=None):
                         settled_since = None
                     accept_command = settled_since is not None and now - settled_since >= IMPEDANCE_SETTLE_SECONDS
                     if not accept_command and now - impedance_wait_started >= IMPEDANCE_WAIT_SECONDS:
+                        trace.failure(f"指令 {int(next_id)}：进入阻抗前未能停稳")
                         rejected_mode_id = next_id
 
                 if accept_command:
                     command_id = next_id
+                    position_mode_seen.clear()
                     active_mode = mode
                     native_mode = mode if mode in NATIVE_MODES else None
                     return_deadline = deadline
@@ -506,12 +593,13 @@ def monitor_robot(session, errors, *, exit_worker=None):
                             for position, lower, upper in zip(
                                 positions, robot.joint_limits["lower"], robot.joint_limits["upper"]
                             )
-                        ]
+                        ] if mode != POINT_PAUSE or speed > 0 else None
                         hold_speed = min(RETURN_SPEED, min(robot.velocity_limits))
-                        speeds = [hold_speed] * ARM_JOINTS
+                        speeds = [hold_speed] * ARM_JOINTS if target is not None else None
                         gripper_target = (
                             max(gripper_limits[0], min(gripper_limits[1], positions[-1]))
-                            if math.isfinite(gripper_limits[0]) else math.nan
+                            if math.isfinite(gripper_limits[0]) and (mode != POINT_PAUSE or next_gripper_speed > 0)
+                            else math.nan
                         )
                         gripper_speed = min(hold_speed, GRIPPER_MAX_SPEED)
                     elif mode == POINT_POSITION:
@@ -543,8 +631,13 @@ def monitor_robot(session, errors, *, exit_worker=None):
                     stopped = all(abs(value) <= POSITION_SETTLE_SPEED for value in velocities[:len(motors)])
                     joint_goals = target if target is not None else [math.nan] * ARM_JOINTS
                     reached = all(
-                        not math.isfinite(goal) or abs(position - goal) <= POSITION_TOLERANCE
-                        for position, goal in zip(positions, (*joint_goals, gripper_target))
+                        not math.isfinite(goal) or (
+                            drive_mode == MOTOR_POSITION_MODE and not fault
+                            and abs(position - goal) <= POSITION_TOLERANCE
+                        )
+                        for position, goal, drive_mode, fault in zip(
+                            positions, (*joint_goals, gripper_target), motor_modes, motor_faults
+                        )
                     )
                     if not stopped or not reached:
                         position_settled_since = None
@@ -564,30 +657,45 @@ def monitor_robot(session, errors, *, exit_worker=None):
                     if fault_message:
                         raise RuntimeError(fault_message)
                     if applied_command_id == command_id:
+                        if not return_deadline and not session.timed_control_started.value:
+                            continue
+                        controlled = list(range(ARM_JOINTS)) if arm_command is not None else []
+                        if has_gripper_target:
+                            controlled.append(ARM_JOINTS)
+                        missing = [i for i in controlled if motor_modes[i] != MOTOR_POSITION_MODE]
+                        lost = position_mode_seen.intersection(missing)
+                        position_mode_seen.update(i for i in controlled if i not in missing)
+                        if lost or (missing and now - applied_at >= POSITION_RESPONSE_SECONDS):
+                            axes = "、".join(f"{motor_name(i)}（模式 {int(motor_modes[i])}）" for i in missing)
+                            raise RuntimeError("未能保持位置控制，已停止刷新：" + axes)
+                        if missing or not controlled:
+                            continue
                         if return_deadline:
-                            count = MOTOR_SLOTS if has_gripper_target else ARM_JOINTS
-                            at_zero = all(
-                                abs(position) <= position_tolerance and abs(velocity) <= RETURN_SETTLE_SPEED
-                                for position, velocity in zip(positions[:count], velocities[:count])
-                            )
+                            at_zero = all(abs(positions[i]) <= position_tolerance
+                                          and abs(velocities[i]) <= RETURN_SETTLE_SPEED for i in controlled)
                             settled_samples = settled_samples + 1 if at_zero else 0
                             if settled_samples >= RETURN_SETTLE_SAMPLES:
                                 session.returned.value = True
                                 break
-                        if not return_deadline:
-                            continue
-                    # Ordinary position goals are sent once, as in the official example.
-                    # Only homing refreshes its goal, independently of the page heartbeat.
                     if not return_deadline and now - session.last_status_request.value > CONTROL_LEASE:
                         raise RuntimeError("控制页面已失联，位置控制已结束")
-                    with session.command.locked():
-                        if session.command[0] != next_id or stop.is_set():
+                    with session.dispatch(next_id) as current:
+                        if not current:
                             continue
+                        write_at = time.monotonic()
+                        if (applied_command_id == command_id and session.timed_control_started.value
+                                and write_at - last_point_write >= control_watchdog_ms(robot) / 1000):
+                            raise RuntimeError("位置刷新间隔已超过设备超时，未重新发送目标")
                         send_position_target(robot, arm_command, speeds, gripper_command, gripper_speed)
+                        last_point_write = write_at
                         if arm_command is not None:
                             applied_targets[:ARM_JOINTS] = arm_command
                         if has_gripper_target:
                             applied_targets[-1] = gripper_command
+                    kind = ("home" if return_deadline else "mode_hold" if active_mode == POSITION else
+                            "position_pause" if active_mode == POINT_PAUSE else "position")
+                    policy = "home_refresh" if return_deadline else "watchdog_refresh" if session.timed_control_started.value else "once"
+                    trace_position(trace, command_id, kind, arm_command, gripper_command, policy)
                     confirmed_mode = POSITION
                     if applied_command_id != command_id:
                         applied_command_id = command_id
@@ -602,15 +710,17 @@ def monitor_robot(session, errors, *, exit_worker=None):
                 if native_mode and not stop.is_set():
                     if now - session.last_status_request.value > CONTROL_LEASE:
                         raise RuntimeError("控制页面已失联，SDK 轨迹已结束")
-                    with session.command.locked():
-                        if session.command[0] != next_id:
+                    with session.dispatch(next_id) as current:
+                        if not current:
                             continue
                         frame = native_target(native_mode == SDK_SINE, session.trajectory,
                                               int(next_target[0]), speed, now - native_started, native_index)
-                        send_sdk_target(robot, native_mode, frame, positions)
-                    if not timed_configured:
-                        enable_control_watchdog(robot, session)
-                        timed_configured = True
+                        details = send_sdk_target(robot, native_mode, frame, positions)
+                        trace.write(command_id, "sdk_sine" if native_mode == SDK_SINE else "sdk_replay", details)
+                        if not timed_configured:
+                            timeout_ms = enable_control_watchdog(robot, session)
+                            trace.write(command_id, "watchdog", {"axes": ALL_AXES[:len(motors)], "timeout_ms": timeout_ms, "policy": "configure"})
+                            timed_configured = True
                     native_index = frame[-1]
                     applied_targets[:ARM_JOINTS] = frame[0]
                     applied_targets[-1] = frame[2]
@@ -622,8 +732,17 @@ def monitor_robot(session, errors, *, exit_worker=None):
                 if torque_control and not stop.is_set():
                     if now - session.last_status_request.value > CONTROL_LEASE:
                         raise RuntimeError("控制页面已失联，力矩控制已结束")
-                    if torque_control.send(positions, velocities, now):
-                        confirmed_mode = torque_control.mode
+                    with session.dispatch(next_id) as current:
+                        if not current:
+                            continue
+                        if torque_control.send(positions, velocities, now):
+                            confirmed_mode = torque_control.mode
+                    details = {"axes": ALL_AXES if robot.has_gripper else ARM_AXES, "policy": "stream",
+                               "torques": torque_control.torque, "joint_mit_position": torque_control.zero}
+                    if robot.has_gripper:
+                        details["gripper_mit"] = (torque_control.gripper_position if torque_control.gripper_gain else 0.,
+                                                  0., 0., .65 * torque_control.gripper_gain, .06 * torque_control.gripper_gain)
+                    trace.write(command_id, CONTROL_MODES[int(torque_control.mode)], details)
                     # Match the official compensation/impedance scripts: do not
                     # configure a persistent watchdog that also affects later position goals.
                     applied_targets[:ARM_JOINTS] = torque_control.target or [math.nan] * ARM_JOINTS
@@ -637,15 +756,19 @@ def monitor_robot(session, errors, *, exit_worker=None):
                     if now - session.last_status_request.value > CONTROL_LEASE:
                         raise RuntimeError("控制页面已失联，位置控制已结束")
                     # Serialize dispatch with the pause request, so a replaced target cannot be sent later.
-                    with session.command.locked():
-                        if session.command[0] != next_id:
+                    with session.dispatch(next_id) as current:
+                        if not current:
                             continue
                         send_position_target(robot, arm_command, speeds, gripper_command, gripper_speed)
+                        trace_position(trace, command_id, "action_pause" if active_mode == PAUSE_POSITION else
+                                       "action_position" if active_mode == MOVE_POSITION else "stream_position",
+                                       arm_command, gripper_command, "stream")
                         if arm_command is not None:
                             applied_targets[:ARM_JOINTS] = arm_command
-                    if not timed_configured:
-                        enable_control_watchdog(robot, session)
-                        timed_configured = True
+                        if not timed_configured:
+                            timeout_ms = enable_control_watchdog(robot, session)
+                            trace.write(command_id, "watchdog", {"axes": ALL_AXES[:len(motors)], "timeout_ms": timeout_ms, "policy": "configure"})
+                            timed_configured = True
                     applied_targets[-1] = gripper_command
                     confirmed_mode = POSITION
                     if applied_command_id != command_id and command_id != rejected_mode_id:
@@ -654,6 +777,7 @@ def monitor_robot(session, errors, *, exit_worker=None):
                 elif stop.wait(0.06):
                     break
             elif zero_verify_deadline and now >= zero_verify_deadline:
+                trace.failure("零位读回未收到完整反馈")
                 session.zero[0] = ZERO_UNVERIFIED
                 zero_verify_deadline = 0
             elif zero_verify_deadline:
@@ -662,8 +786,9 @@ def monitor_robot(session, errors, *, exit_worker=None):
                 missing = "、".join(motor.get_motor_name() for motor in pending.values())
                 raise RuntimeError(f"未收到电机反馈（{missing}）")
     except KeyboardInterrupt:
-        pass
+        trace.failure("工作进程收到 KeyboardInterrupt")
     except (Exception, SystemExit) as exc:
+        trace.failure(str(exc))
         print(f"Panthera: {exc}", file=sys.stderr, flush=True)
         message = str(exc) if isinstance(exc, RuntimeError) else "Panthera SDK 初始化或读取失败"
         # Keep the notification within a single atomic pipe write on Linux.

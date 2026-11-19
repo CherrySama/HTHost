@@ -227,7 +227,7 @@ def publish_feedback(session, position):
     session.feedback[:] = [
         time.monotonic(), control.POSITION, 0, 0, 0, 0,
         *([position] * slots), *([0] * (2 * slots)),
-        *([math.nan] * slots), *([11] * slots), *([0] * slots),
+        *([math.nan] * slots), *([11] * slots), *([0] * slots), 0,
     ]
 
 
@@ -525,7 +525,7 @@ class ModeTransitionTests(unittest.TestCase):
         shared = multiprocessing.get_context("spawn").RawValue("b", False)
         commands = {2: [1, control.POINT_POSITION, .2, .2, .8, 0, *([.8] * 6)],
                     12: [2, control.POINT_POSITION, .2, .2, .2, 0, *([.2] * 6)],
-                    22: [3, control.POINT_PAUSE, 0, 0, math.nan, 0, *([0] * 6)]}
+                    22: [3, control.POINT_PAUSE, .2, .2, math.nan, 0, *([0] * 6)]}
         robot, session, errors = run_bridge([.4] * 7, device=device, commands=commands,
             ticks=100, timed_control_started=shared)
         self.assertEqual(errors, [])
@@ -729,7 +729,7 @@ class PositionRecoveryTests(unittest.TestCase):
 
     def test_return_refreshes_until_settled_without_page_or_timeout_configuration(self):
         command = [1, control.POINT_POSITION, 0.2, 0.2, 0, 110, *([0] * 6)]
-        robot, session, errors = run_bridge([0] * 7, commands={2: command}, page_alive=False)
+        robot, session, errors = run_bridge([0] * 7, commands={2: command}, page_alive=False, device=PersistentDevice(0))
         self.assertEqual(errors, [])
         self.assertTrue(session.returned.value)
         self.assertGreater(sum(c[1] == 0x90 for c in robot.calls), 1)
@@ -737,7 +737,7 @@ class PositionRecoveryTests(unittest.TestCase):
 
     def test_return_timeout_stops_refreshing_without_reporting_success(self):
         command = [1, control.POINT_POSITION, 0.2, 0.2, 0, 100.3, *([0] * 6)]
-        robot, session, errors = run_bridge([0.25] * 7, commands={2: command}, page_alive=False)
+        robot, session, errors = run_bridge([0.25] * 7, commands={2: command}, page_alive=False, device=PersistentDevice(.25))
         self.assertFalse(session.returned.value)
         self.assertIn("等待到位超时", errors)
         self.assertGreater(sum(c[1] == 0x90 for c in robot.calls), 1)
@@ -763,7 +763,7 @@ class PositionRecoveryTests(unittest.TestCase):
         self.assertEqual([call[1] for call in commands], [0x90])
         self.assertEqual([command[:2] for command in commands[-1][2]], [(0.12, 0.2)] * 7)
 
-    def test_stream_watchdog_is_not_cleared_or_hidden_by_point_refresh(self):
+    def test_stream_watchdog_is_kept_and_point_refreshes_after_confirmation(self):
         point = [1, control.POINT_POSITION, 0.2, 0, math.nan, 0, *([0.1] * 6)]
         stream = [2, control.STREAM_POSITION, 0.2, 0, math.nan, 0, *([0.12] * 6)]
         next_point = [3, control.POINT_POSITION, 0.2, 0, math.nan, 0, *([0.6] * 6)]
@@ -775,14 +775,14 @@ class PositionRecoveryTests(unittest.TestCase):
         goals = [call[2][0][0] for call in robot.calls if call[1] == 0x90]
         self.assertEqual(goals.count(0.1), 1)
         self.assertGreater(goals.count(0.12), 1)
-        self.assertEqual(goals.count(0.6), 1)
+        self.assertGreater(goals.count(0.6), 1)
         self.assertEqual(robot.device.timeout_ms, 250)
-        self.assertTrue(robot.device.expired)  # 已有设备超时仍是未解决的边界。
+        self.assertFalse(robot.device.expired)
 
     def test_gripper_only_goal_does_not_resend_previous_arm_goal(self):
         arm = [1, control.POINT_POSITION, 0.2, 0, math.nan, 0, *([0.12] * 6)]
         gripper = [2, control.POINT_POSITION, 0, 0.2, 0.12, 0, *([0] * 6)]
-        robot, session, errors = run_bridge([0.12] * 7, commands={2: arm, 8: gripper})
+        robot, session, errors = run_bridge([0.12] * 7, commands={2: arm, 8: gripper}, device=PersistentDevice(.12))
         self.assertEqual(errors, [])
         positions = [call[2] for call in robot.calls if call[1] == 0x90]
         self.assertEqual(len(positions), 2)
@@ -809,7 +809,7 @@ class PositionRecoveryTests(unittest.TestCase):
 
     def test_arrival_keeps_polling_without_resending(self):
         point = [1, control.POINT_POSITION, 0.2, 0.2, 0.12, 0, *([0.12] * 6)]
-        robot, session, errors = run_bridge([0.12] * 7, commands={2: point})
+        robot, session, errors = run_bridge([0.12] * 7, commands={2: point}, device=PersistentDevice(.12))
         self.assertEqual(errors, [])
         self.assertEqual(session.feedback[5], 1)  # 已确认到位。
         self.assertEqual(sum(call[1] == 0x90 for call in robot.calls), 1)
@@ -818,12 +818,13 @@ class PositionRecoveryTests(unittest.TestCase):
 
     def test_pause_sends_current_position_once(self):
         point = [1, control.POINT_POSITION, 0.2, 0.2, 0.6, 0, *([0.6] * 6)]
-        pause = [2, control.POINT_PAUSE, 0, 0, math.nan, 0, *([0] * 6)]
-        robot, session, errors = run_bridge([0.25] * 7, commands={2: point, 6: pause})
+        pause = [2, control.POINT_PAUSE, .2, .2, math.nan, 0, *([0] * 6)]
+        robot, session, errors = run_bridge([0.25] * 7, commands={2: point, 6: pause}, device=PersistentDevice(.25))
         self.assertEqual(errors, [])
         goals = [call[2] for call in robot.calls if call[1] == 0x90]
         self.assertEqual(len(goals), 2)
-        self.assertEqual([entry[0] for entry in goals[-1]], [0.25] * 7)
+        self.assertEqual([entry[0] for entry in goals[-1]], robot.device.positions)
+        self.assertTrue(.25 < robot.device.positions[0] < .6)
         self.assertEqual(session.feedback[5], 2)
 
     def test_lost_feedback_does_not_continue_position_dispatch(self):

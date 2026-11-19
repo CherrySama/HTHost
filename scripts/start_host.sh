@@ -63,7 +63,20 @@ start_service() {
     return
   fi
 
-  setsid "$@" </dev/null >"$log" 2>&1 9>&- &
+  # Keep the previous incident across a restart. Rotate only before a new process opens its log.
+  if [[ -f "$log" ]] && (( $(stat -c %s -- "$log") >= 10485760 )); then
+    "$python_bin" - "$log" <<'PY'
+from pathlib import Path
+import sys
+base = Path(sys.argv[1]).resolve()
+for n in range(3, 0, -1):
+    old = base if n == 1 else base.with_name(f'{base.name}.{n-1}')
+    if old.exists():
+        old.replace(base.with_name(f'{base.name}.{n}'))
+PY
+  fi
+  printf '\n%s 启动%s\n' "$(date -Is)" "$label" >>"$log"
+  setsid "$@" </dev/null >>"$log" 2>&1 9>&- &
   pid=$!
   started_pids+=("$pid")
   for ((attempt = 0; attempt < 60; attempt++)); do
